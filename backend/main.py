@@ -625,138 +625,53 @@ async def analyze_swot_framework(
 ) -> Dict[str, Any]:
     """
     Dedicated SWOT API.
-    Runs source collection + ABSA + confidence aggregation, then generates
-    source-cited SWOT and persists it separately from business insights.
+    Reuses existing DB data prepared by /analyze/business/insights
+    to generate source-cited SWOT quickly (no re-scraping).
     """
     start_time = datetime.now()
 
-    if not gmaps:
-        raise HTTPException(status_code=503, detail="Google Maps API not configured")
-
     try:
-        query = f"{request.business_name} {request.area} {request.city}"
-        places_result = gmaps.places(query=query)
-        if not places_result.get("results"):
-            raise HTTPException(status_code=404, detail=f"No business found: {query}")
+        business_db = crud.get_business_by_name(db, request.business_name, request.city)
+        if not business_db:
+            raise HTTPException(
+                status_code=404,
+                detail="Business not found in DB. Run /analyze/business/insights first.",
+            )
 
-        place = places_result["results"][0]
-        place_id = place["place_id"]
-        place_name = place["name"]
-        place_addr = place.get("formatted_address", "")
-
-        details = gmaps.place(
-            place_id=place_id,
-            fields=["name", "rating", "user_ratings_total", "reviews"],
+        analysis_db = (
+            crud.get_latest_analysis(db, business_db.id, "absa_full")
+            or crud.get_latest_analysis(db, business_db.id, "absa_with_insights")
+            or crud.get_latest_analysis(db, business_db.id, "absa")
         )
-        result_data = details["result"]
-        gmap_reviews = result_data.get("reviews", [])
-        gmap_rating = result_data.get("rating", 0)
-        gmap_total = result_data.get("user_ratings_total", 0)
+        if not analysis_db:
+            raise HTTPException(
+                status_code=400,
+                detail="No ABSA analysis found. Run /analyze/business/insights first.",
+            )
 
-        business_db = crud.get_or_create_business(
-            db=db,
-            place_id=place_id,
-            name=place_name,
-            category="restaurant",
-            address=place_addr,
-            location=request.city,
-            latitude=place.get("geometry", {}).get("location", {}).get("lat"),
-            longitude=place.get("geometry", {}).get("location", {}).get("lng"),
-            rating=gmap_rating,
-            total_reviews=gmap_total,
-        )
+        aggregated_rows = crud.get_aggregated_absa(db, business_db.id)
+        if not aggregated_rows:
+            raise HTTPException(
+                status_code=400,
+                detail="No aggregated ABSA found. Run /analyze/business/insights first.",
+            )
 
-        set_aspect_keywords_for_category("restaurant")
+        aggregated = [
+            {
+                "aspect": row.aspect,
+                "overall_sentiment": row.overall_sentiment,
+                "confidence_score": row.confidence_score,
+                "source_breakdown": row.source_breakdown,
+                "conflict_flag": row.conflict_flag,
+                "conflict_detail": row.conflict_detail,
+            }
+            for row in aggregated_rows
+        ]
 
-        gmap_texts = [r["text"] for r in gmap_reviews if r.get("text")]
-        gmap_absa = analyze_multiple_reviews(gmap_texts) if gmap_texts else {}
-        for r in gmap_reviews:
-            if r.get("text"):
-                crud.create_review(
-                    db=db,
-                    business_id=business_db.id,
-                    review_text=r["text"],
-                    author_name=r.get("author_name"),
-                    rating=r.get("rating"),
-                    review_date=(datetime.fromtimestamp(r["time"]) if r.get("time") else None),
-                    source="google_maps",
-                )
-
-        twitter_query = request.twitter_query or f"{request.business_name} {request.city}"
-        try:
-            twitter_reviews = get_restaurant_reviews(twitter_query) or []
-        except Exception as twitter_err:
-            logger.warning(f"Twitter scraper failed: {twitter_err}")
-            twitter_reviews = []
-
-        twitter_texts = [t.get("text", "").strip() for t in twitter_reviews if t.get("text")]
-        twitter_absa = analyze_multiple_reviews(twitter_texts) if twitter_texts else {}
-        for t in twitter_reviews:
-            text = t.get("text")
-            if text:
-                crud.create_review(
-                    db=db,
-                    business_id=business_db.id,
-                    review_text=text,
-                    author_name="twitter_user",
-                    rating=None,
-                    review_date=None,
-                    source="twitter",
-                )
-
-        if gmap_texts or twitter_texts:
-            ingest_reviews_to_chroma(place_name, gmap_texts + twitter_texts)
-
+        reviews = crud.get_reviews_by_business(db, business_db.id)
+        gmap_texts = [r.review_text for r in reviews if (r.source or "") == "google_maps" and r.review_text]
+        twitter_texts = [r.review_text for r in reviews if (r.source or "") == "twitter" and r.review_text]
         all_review_texts = gmap_texts + twitter_texts
-        combined_absa = analyze_multiple_reviews(all_review_texts) if all_review_texts else {}
-
-        aggregated = compute_all_aspect_confidence(
-            gmap_absa=gmap_absa,
-            twitter_absa=twitter_absa,
-            months_back=request.months_back,
-        )
-        variances = compute_sentiment_variance(aggregated)
-
-        negative_sentences = []
-        for src_name, src_absa in [("google_maps", gmap_absa), ("twitter", twitter_absa)]:
-            for aspect, data in src_absa.items():
-                if isinstance(data, dict):
-                    for detail in data.get("details", []):
-                        if detail.get("sentiment") == "Negative":
-                            negative_sentences.append(
-                                {
-                                    "sentence": detail.get("sentence", ""),
-                                    "aspect": aspect,
-                                    "source": src_name,
-                                    "confidence": detail.get("score", 0.0),
-                                }
-                            )
-        mece_clusters = cluster_complaints(negative_sentences)
-
-        analysis_db = crud.create_analysis(
-            db=db,
-            business_id=business_db.id,
-            analysis_type="absa_full",
-            total_reviews_analyzed=len(all_review_texts),
-            aspect_results={
-                "combined": combined_absa,
-                "google_maps": gmap_absa,
-                "twitter": twitter_absa,
-            },
-            months_back=request.months_back,
-            sources_used={
-                "google_maps": len(gmap_texts),
-                "twitter": len(twitter_texts),
-            },
-        )
-        crud.save_aggregated_absa(
-            db=db,
-            business_id=business_db.id,
-            analysis_id=analysis_db.id,
-            aspect_confidence_list=aggregated,
-            mece_clusters=mece_clusters,
-            sentiment_variances=variances,
-        )
 
         latest_competitors = crud.get_latest_competitors(db, business_db.id)
         competitor_summaries = [
@@ -778,24 +693,26 @@ async def analyze_swot_framework(
             }
             for n in latest_news_rows
         ]
-        review_evidence = [
-            {
-                "source": "google_maps",
-                "text": txt,
-                "source_reference": "google_maps_review",
-            }
-            for txt in gmap_texts[:30]
-        ] + [
-            {
-                "source": "twitter",
-                "text": txt,
-                "source_reference": "twitter_post",
-            }
-            for txt in twitter_texts[:30]
-        ]
+        # Keep payload format unchanged while improving source attribution per citation.
+        review_evidence = []
+        for r in reviews[:60]:
+            if not r.review_text:
+                continue
+            src = r.source or "google_maps"
+            reference = f"{src}_review_id:{r.id}"
+            if r.author_name:
+                reference = f"{src}_author:{r.author_name}|review_id:{r.id}"
+            review_evidence.append(
+                {
+                    "source": src,
+                    "text": r.review_text,
+                    "source_reference": reference,
+                    "author": r.author_name,
+                }
+            )
 
         swot_payload = generate_agentic_swot(
-            business_name=place_name,
+            business_name=business_db.name,
             city=request.city,
             aggregated_absa=aggregated,
             competitor_summaries=competitor_summaries,
@@ -822,7 +739,7 @@ async def analyze_swot_framework(
         execution_time = int((datetime.now() - start_time).total_seconds() * 1000)
         crud.log_analysis(
             db=db,
-            business_name=place_name,
+            business_name=business_db.name,
             category="restaurant",
             location=request.city,
             endpoint="/analyze/frameworks/swot",
@@ -833,17 +750,17 @@ async def analyze_swot_framework(
         return {
             "status": "success",
             "business_info": {
-                "name": place_name,
+                "name": business_db.name,
                 "area": request.area,
                 "city": request.city,
-                "address": place_addr,
-                "place_id": place_id,
-                "twitter_query_used": twitter_query,
+                "address": business_db.address,
+                "place_id": business_db.place_id,
+                "twitter_query_used": request.twitter_query or f"{request.business_name} {request.city}",
                 "months_back": request.months_back,
             },
             "summary_stats": {
                 "total_reviews": len(all_review_texts),
-                "avg_rating": gmap_rating,
+                "avg_rating": business_db.rating,
             },
             "framework": {
                 "type": "swot",
