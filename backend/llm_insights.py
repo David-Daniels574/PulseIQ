@@ -24,13 +24,11 @@ else:
     logger.warning("Gemini API key not found. LLM insights will be disabled.")
 
 # --- NEW: ChromaDB Setup ---
-# Initialize Chroma client.
-# For production, you might want to use a persistent client:
-# chroma_client = chromadb.PersistentClient(path="/path/to/your/db")
-# For this example, we'll use an in-memory client.
+# Initialize Chroma client in persistent mode for stable retrieval.
 try:
-    chroma_client = chromadb.Client()
-    logger.info("ChromaDB in-memory client initialized.")
+    chroma_path = os.getenv("CHROMA_DB_PATH", "./chroma_db")
+    chroma_client = chromadb.PersistentClient(path=chroma_path)
+    logger.info(f"ChromaDB persistent client initialized at: {chroma_path}")
 except Exception as e:
     logger.error(f"Failed to initialize ChromaDB client: {e}")
     chroma_client = None

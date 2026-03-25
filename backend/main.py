@@ -30,6 +30,7 @@ from services.confidence_engine import (
     cluster_complaints,
 )
 from services.framework_llm import generate_all_frameworks
+from services.agentic_swot import generate_agentic_swot
 
 
 from analyzer import (
@@ -158,6 +159,15 @@ class OverviewRequest(BaseModel):
     city: str          = Field(..., description="City e.g. 'Mumbai'")
     twitter_query: Optional[str] = Field(None, description="Optional specific query for Twitter. Defaults to business name.")
     months_back: Optional[int] = Field(6, ge=1, le=24, description="How many months of data to include (default 6)")
+
+
+class SWOTFrameworkRequest(BaseModel):
+    """Request for dedicated SWOT framework generation"""
+    business_name: str = Field(..., description="Name of the restaurant")
+    area: str = Field(..., description="Area/neighbourhood e.g. 'Colaba'")
+    city: str = Field(..., description="City e.g. 'Mumbai'")
+    twitter_query: Optional[str] = Field(None, description="Optional specific query for Twitter. Defaults to business name + city.")
+    months_back: Optional[int] = Field(6, ge=1, le=24, description="How many months of data to include (default 6)")
  
 class CompetitorRequest(BaseModel):
     """Request for the Competitor Analysis page"""
@@ -197,6 +207,23 @@ class FrameworkReportResponse(BaseModel):
     avg_confidence: Optional[float]
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class FrameworkCitationResponse(BaseModel):
+    framework: str
+    quadrant: str
+    point_id: str
+    point_label: str
+    confidence_pct: Optional[float]
+    suggestion: Optional[str]
+    derived_insight: Optional[str]
+    source_type: str
+    source_strength: Optional[str]
+    source_quote: str
+    source_reference: Optional[str]
+    source_url: Optional[str]
+
+    model_config = ConfigDict(from_attributes=True)
  
 
 # Startup event
@@ -231,6 +258,7 @@ async def root():
             "/analyze": "POST - Analyze a single review text",
             "/analyze/business": "POST - Fetch and analyze business reviews from Google Maps",
             "/analyze/business/insights": "POST - Fetch reviews, analyze, AND generate strategic insights (STORED IN DB)",
+            "/analyze/frameworks/swot": "POST - Generate SWOT framework with source citations",
             "/analyze/competitors": "POST - Find and analyze top 4 competitors in your area",
             "/market-intelligence": "POST - Star-rating forecast + industry trend and market news",
             "/insights/generate": "POST - Generate insights from existing ABSA results",
@@ -588,6 +616,316 @@ async def analyze_business_overview(
         except Exception:
             pass
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/analyze/frameworks/swot")
+async def analyze_swot_framework(
+    request: SWOTFrameworkRequest,
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """
+    Dedicated SWOT API.
+    Runs source collection + ABSA + confidence aggregation, then generates
+    source-cited SWOT and persists it separately from business insights.
+    """
+    start_time = datetime.now()
+
+    if not gmaps:
+        raise HTTPException(status_code=503, detail="Google Maps API not configured")
+
+    try:
+        query = f"{request.business_name} {request.area} {request.city}"
+        places_result = gmaps.places(query=query)
+        if not places_result.get("results"):
+            raise HTTPException(status_code=404, detail=f"No business found: {query}")
+
+        place = places_result["results"][0]
+        place_id = place["place_id"]
+        place_name = place["name"]
+        place_addr = place.get("formatted_address", "")
+
+        details = gmaps.place(
+            place_id=place_id,
+            fields=["name", "rating", "user_ratings_total", "reviews"],
+        )
+        result_data = details["result"]
+        gmap_reviews = result_data.get("reviews", [])
+        gmap_rating = result_data.get("rating", 0)
+        gmap_total = result_data.get("user_ratings_total", 0)
+
+        business_db = crud.get_or_create_business(
+            db=db,
+            place_id=place_id,
+            name=place_name,
+            category="restaurant",
+            address=place_addr,
+            location=request.city,
+            latitude=place.get("geometry", {}).get("location", {}).get("lat"),
+            longitude=place.get("geometry", {}).get("location", {}).get("lng"),
+            rating=gmap_rating,
+            total_reviews=gmap_total,
+        )
+
+        set_aspect_keywords_for_category("restaurant")
+
+        gmap_texts = [r["text"] for r in gmap_reviews if r.get("text")]
+        gmap_absa = analyze_multiple_reviews(gmap_texts) if gmap_texts else {}
+        for r in gmap_reviews:
+            if r.get("text"):
+                crud.create_review(
+                    db=db,
+                    business_id=business_db.id,
+                    review_text=r["text"],
+                    author_name=r.get("author_name"),
+                    rating=r.get("rating"),
+                    review_date=(datetime.fromtimestamp(r["time"]) if r.get("time") else None),
+                    source="google_maps",
+                )
+
+        twitter_query = request.twitter_query or f"{request.business_name} {request.city}"
+        try:
+            twitter_reviews = get_restaurant_reviews(twitter_query) or []
+        except Exception as twitter_err:
+            logger.warning(f"Twitter scraper failed: {twitter_err}")
+            twitter_reviews = []
+
+        twitter_texts = [t.get("text", "").strip() for t in twitter_reviews if t.get("text")]
+        twitter_absa = analyze_multiple_reviews(twitter_texts) if twitter_texts else {}
+        for t in twitter_reviews:
+            text = t.get("text")
+            if text:
+                crud.create_review(
+                    db=db,
+                    business_id=business_db.id,
+                    review_text=text,
+                    author_name="twitter_user",
+                    rating=None,
+                    review_date=None,
+                    source="twitter",
+                )
+
+        if gmap_texts or twitter_texts:
+            ingest_reviews_to_chroma(place_name, gmap_texts + twitter_texts)
+
+        all_review_texts = gmap_texts + twitter_texts
+        combined_absa = analyze_multiple_reviews(all_review_texts) if all_review_texts else {}
+
+        aggregated = compute_all_aspect_confidence(
+            gmap_absa=gmap_absa,
+            twitter_absa=twitter_absa,
+            months_back=request.months_back,
+        )
+        variances = compute_sentiment_variance(aggregated)
+
+        negative_sentences = []
+        for src_name, src_absa in [("google_maps", gmap_absa), ("twitter", twitter_absa)]:
+            for aspect, data in src_absa.items():
+                if isinstance(data, dict):
+                    for detail in data.get("details", []):
+                        if detail.get("sentiment") == "Negative":
+                            negative_sentences.append(
+                                {
+                                    "sentence": detail.get("sentence", ""),
+                                    "aspect": aspect,
+                                    "source": src_name,
+                                    "confidence": detail.get("score", 0.0),
+                                }
+                            )
+        mece_clusters = cluster_complaints(negative_sentences)
+
+        analysis_db = crud.create_analysis(
+            db=db,
+            business_id=business_db.id,
+            analysis_type="absa_full",
+            total_reviews_analyzed=len(all_review_texts),
+            aspect_results={
+                "combined": combined_absa,
+                "google_maps": gmap_absa,
+                "twitter": twitter_absa,
+            },
+            months_back=request.months_back,
+            sources_used={
+                "google_maps": len(gmap_texts),
+                "twitter": len(twitter_texts),
+            },
+        )
+        crud.save_aggregated_absa(
+            db=db,
+            business_id=business_db.id,
+            analysis_id=analysis_db.id,
+            aspect_confidence_list=aggregated,
+            mece_clusters=mece_clusters,
+            sentiment_variances=variances,
+        )
+
+        latest_competitors = crud.get_latest_competitors(db, business_db.id)
+        competitor_summaries = [
+            {
+                "name": c.competitor_name,
+                "rating": c.competitor_rating,
+                "reviews": c.competitor_reviews,
+                "rating_difference": c.rating_difference,
+                "aspect_scores": c.competitor_aspect_scores or {},
+            }
+            for c in latest_competitors
+        ]
+        latest_news_rows = crud.get_scraping_results_by_business(db, business_db.id, limit=20)
+        news_mentions = [
+            {
+                "headline": n.headline,
+                "source_name": n.source_name,
+                "link": n.link,
+            }
+            for n in latest_news_rows
+        ]
+        review_evidence = [
+            {
+                "source": "google_maps",
+                "text": txt,
+                "source_reference": "google_maps_review",
+            }
+            for txt in gmap_texts[:30]
+        ] + [
+            {
+                "source": "twitter",
+                "text": txt,
+                "source_reference": "twitter_post",
+            }
+            for txt in twitter_texts[:30]
+        ]
+
+        swot_payload = generate_agentic_swot(
+            business_name=place_name,
+            city=request.city,
+            aggregated_absa=aggregated,
+            competitor_summaries=competitor_summaries,
+            news_mentions=news_mentions,
+            review_evidence=review_evidence,
+        )
+
+        swot_reports = crud.save_framework_reports(
+            db=db,
+            business_id=business_db.id,
+            analysis_id=analysis_db.id,
+            frameworks={"swot": swot_payload["result_json"]},
+            avg_confidence_per_framework={"swot": float(swot_payload["confidence_pct"])},
+            sources_used=["google_maps", "twitter"] + (["news"] if news_mentions else []),
+        )
+        if swot_reports:
+            crud.save_framework_citations(
+                db=db,
+                business_id=business_db.id,
+                framework_report_id=swot_reports[0].id,
+                citations=swot_payload.get("citations", []),
+            )
+
+        execution_time = int((datetime.now() - start_time).total_seconds() * 1000)
+        crud.log_analysis(
+            db=db,
+            business_name=place_name,
+            category="restaurant",
+            location=request.city,
+            endpoint="/analyze/frameworks/swot",
+            status="success",
+            execution_time_ms=execution_time,
+        )
+
+        return {
+            "status": "success",
+            "business_info": {
+                "name": place_name,
+                "area": request.area,
+                "city": request.city,
+                "address": place_addr,
+                "place_id": place_id,
+                "twitter_query_used": twitter_query,
+                "months_back": request.months_back,
+            },
+            "summary_stats": {
+                "total_reviews": len(all_review_texts),
+                "avg_rating": gmap_rating,
+            },
+            "framework": {
+                "type": "swot",
+                "confidence_pct": swot_payload.get("confidence_pct", 0),
+                "result_json": swot_payload.get("result_json", {}),
+            },
+            "execution_time_ms": execution_time,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"SWOT framework endpoint error: {e}")
+        execution_time = int((datetime.now() - start_time).total_seconds() * 1000)
+        try:
+            crud.log_analysis(
+                db=db,
+                business_name=request.business_name,
+                category="restaurant",
+                location=request.city,
+                endpoint="/analyze/frameworks/swot",
+                status="failed",
+                error_message=str(e),
+                execution_time_ms=execution_time,
+            )
+        except Exception:
+            pass
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/business/{place_id}/reports")
+async def get_business_reports(place_id: str, db: Session = Depends(get_db)) -> Dict[str, Any]:
+    """
+    Return saved framework reports for a business.
+    Includes point-level citations for SWOT.
+    """
+    business = crud.get_business_by_place_id(db, place_id)
+    if not business:
+        raise HTTPException(status_code=404, detail="Business not found")
+
+    reports = crud.get_all_framework_reports(db, business.id)
+    out: List[Dict[str, Any]] = []
+
+    for report in reports:
+        item = {
+            "framework": str(report.framework),
+            "result_json": report.result_json,
+            "sources_used": report.sources_used,
+            "avg_confidence": report.avg_confidence,
+            "generated_at": report.generated_at,
+        }
+        framework_name = report.framework.value if hasattr(report.framework, "value") else str(report.framework)
+        if framework_name == "swot":
+            citations = crud.get_framework_citations(db, report.id)
+            item["citations"] = [
+                {
+                    "framework": c.framework,
+                    "quadrant": c.quadrant,
+                    "point_id": c.point_id,
+                    "point_label": c.point_label,
+                    "confidence_pct": c.confidence_pct,
+                    "suggestion": c.suggestion,
+                    "derived_insight": c.derived_insight,
+                    "source_type": c.source_type,
+                    "source_strength": c.source_strength,
+                    "source_quote": c.source_quote,
+                    "source_reference": c.source_reference,
+                    "source_url": c.source_url,
+                }
+                for c in citations
+            ]
+        out.append(item)
+
+    return {
+        "status": "success",
+        "business": {
+            "place_id": business.place_id,
+            "name": business.name,
+            "city": business.location,
+        },
+        "reports": out,
+    }
 
 # Generate review response template
 @app.post("/insights/response-template")

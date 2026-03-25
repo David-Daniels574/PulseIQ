@@ -290,6 +290,31 @@ def parse_framework_response(raw_text: str) -> Dict[str, Any]:
     return data
 
 
+def validate_swot_with_citations(swot_data: Dict[str, Any]) -> None:
+    """
+    Validate SWOT payload shape used by the agentic pipeline.
+    Raises ValueError when minimum fields are missing.
+    """
+    required_quadrants = {"strengths", "weaknesses", "opportunities", "threats"}
+    missing = required_quadrants - set(swot_data.keys())
+    if missing:
+        raise ValueError(f"SWOT payload missing quadrants: {missing}")
+
+    for quadrant in required_quadrants:
+        points = swot_data.get(quadrant, [])
+        if not isinstance(points, list):
+            raise ValueError(f"SWOT quadrant '{quadrant}' must be a list")
+
+        for idx, point in enumerate(points, start=1):
+            if not isinstance(point, dict):
+                raise ValueError(f"SWOT point {quadrant}[{idx}] must be an object")
+            for field in ["label", "suggestion", "confidence_pct", "source_citation"]:
+                if field not in point:
+                    raise ValueError(
+                        f"SWOT point {quadrant}[{idx}] missing required field '{field}'"
+                    )
+
+
 # ─────────────────────────────────────────────────────────────────────
 # MAIN PUBLIC FUNCTION
 # ─────────────────────────────────────────────────────────────────────

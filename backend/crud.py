@@ -720,6 +720,59 @@ def get_all_framework_reports(
     )
 
 
+def save_framework_citations(
+    db: Session,
+    business_id: int,
+    framework_report_id: int,
+    citations: List[Dict[str, Any]],
+) -> List[models.FrameworkCitation]:
+    """
+    Replace citation rows for a framework report with the latest generated set.
+    """
+    db.query(models.FrameworkCitation).filter(
+        models.FrameworkCitation.framework_report_id == framework_report_id
+    ).delete()
+    db.commit()
+
+    rows: List[models.FrameworkCitation] = []
+    for c in citations:
+        row = models.FrameworkCitation(
+            business_id=business_id,
+            framework_report_id=framework_report_id,
+            framework=c.get("framework", "swot"),
+            quadrant=c.get("quadrant", "strengths"),
+            point_id=c.get("point_id", ""),
+            point_label=c.get("point_label", ""),
+            confidence_pct=c.get("confidence_pct"),
+            suggestion=c.get("suggestion"),
+            derived_insight=c.get("derived_insight"),
+            source_type=c.get("source_type", "news"),
+            source_strength=c.get("source_strength", "Low"),
+            source_quote=c.get("source_quote", ""),
+            source_reference=c.get("source_reference"),
+            source_url=c.get("source_url"),
+        )
+        db.add(row)
+        rows.append(row)
+
+    db.commit()
+    for row in rows:
+        db.refresh(row)
+    return rows
+
+
+def get_framework_citations(
+    db: Session,
+    framework_report_id: int,
+) -> List[models.FrameworkCitation]:
+    return (
+        db.query(models.FrameworkCitation)
+        .filter(models.FrameworkCitation.framework_report_id == framework_report_id)
+        .order_by(models.FrameworkCitation.quadrant, models.FrameworkCitation.point_id)
+        .all()
+    )
+
+
 # ─────────────────────────────────────────────────────────────────────
 # ORM REVIEWS
 # ─────────────────────────────────────────────────────────────────────

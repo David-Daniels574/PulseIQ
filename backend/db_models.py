@@ -79,6 +79,7 @@ class Business(Base):
     social_menu_items  = relationship("SocialMenuItem",     back_populates="business", cascade="all, delete-orphan")
     framework_reports  = relationship("FrameworkReport",    back_populates="business", cascade="all, delete-orphan")  # NEW
     orm_reviews        = relationship("ORMReview",          back_populates="business", cascade="all, delete-orphan")  # NEW
+    framework_citations = relationship("FrameworkCitation", back_populates="business", cascade="all, delete-orphan")
     web_scraping_results = relationship("WebScrapingResult", back_populates="business", cascade="all, delete-orphan")
 
 
@@ -334,6 +335,40 @@ class FrameworkReport(Base):
     generated_at = Column(DateTime(timezone=True), server_default=func.now())
 
     business = relationship("Business", back_populates="framework_reports")
+    citations = relationship("FrameworkCitation", back_populates="framework_report", cascade="all, delete-orphan")
+
+
+# ─────────────────────────────────────────────
+# NEW TABLE — FrameworkCitation
+# Stores evidence references for each SWOT point
+# ─────────────────────────────────────────────
+
+class FrameworkCitation(Base):
+    __tablename__ = "framework_citations"
+
+    id = Column(Integer, primary_key=True, index=True)
+    business_id = Column(Integer, ForeignKey("businesses.id", ondelete="CASCADE"), nullable=False)
+    framework_report_id = Column(Integer, ForeignKey("framework_reports.id", ondelete="CASCADE"), nullable=False)
+
+    framework = Column(String(50), nullable=False, default="swot")
+    quadrant = Column(String(50), nullable=False)     # strengths|weaknesses|opportunities|threats
+    point_id = Column(String(100), nullable=False)    # swot_strength_1, etc.
+    point_label = Column(String(255), nullable=False)
+
+    confidence_pct = Column(Float)
+    suggestion = Column(Text)
+    derived_insight = Column(Text)
+
+    source_type = Column(String(50), nullable=False)  # google_maps|twitter|news
+    source_strength = Column(String(20))              # Low|Medium|High
+    source_quote = Column(Text, nullable=False)
+    source_reference = Column(String(255))            # review id / source name / handle
+    source_url = Column(Text)
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    business = relationship("Business", back_populates="framework_citations")
+    framework_report = relationship("FrameworkReport", back_populates="citations")
 
 
 # ─────────────────────────────────────────────

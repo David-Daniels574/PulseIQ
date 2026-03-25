@@ -16,6 +16,9 @@ xgboost
 pandas
 scikit-learn
 chromadb
+langchain
+langchain-core
+langchain-google-genai
 
 # ── New dependencies ───────────────────────────────────────────────
  
