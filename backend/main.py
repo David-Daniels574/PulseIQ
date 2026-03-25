@@ -31,6 +31,7 @@ from services.confidence_engine import (
 )
 from services.framework_llm import generate_all_frameworks
 from services.agentic_swot import generate_agentic_swot
+from services.agentic_pestel import generate_pestel_framework
 
 
 from analyzer import (
@@ -168,6 +169,14 @@ class SWOTFrameworkRequest(BaseModel):
     city: str = Field(..., description="City e.g. 'Mumbai'")
     twitter_query: Optional[str] = Field(None, description="Optional specific query for Twitter. Defaults to business name + city.")
     months_back: Optional[int] = Field(6, ge=1, le=24, description="How many months of data to include (default 6)")
+
+
+class PESTELFrameworkRequest(BaseModel):
+    """Request for dedicated PESTEL + 4P generation"""
+    business_name: str = Field(..., description="Name of the restaurant")
+    area: str = Field(..., description="Area/neighbourhood e.g. 'Colaba'")
+    city: str = Field(..., description="City e.g. 'Mumbai'")
+    months_back: Optional[int] = Field(6, ge=1, le=24, description="How many months of data to include (default 6)")
  
 class CompetitorRequest(BaseModel):
     """Request for the Competitor Analysis page"""
@@ -259,6 +268,7 @@ async def root():
             "/analyze/business": "POST - Fetch and analyze business reviews from Google Maps",
             "/analyze/business/insights": "POST - Fetch reviews, analyze, AND generate strategic insights (STORED IN DB)",
             "/analyze/frameworks/swot": "POST - Generate SWOT framework with source citations",
+            "/analyze/frameworks/pestel": "POST - Generate PESTEL + 4P framework from cached DB data",
             "/analyze/competitors": "POST - Find and analyze top 4 competitors in your area",
             "/market-intelligence": "POST - Star-rating forecast + industry trend and market news",
             "/insights/generate": "POST - Generate insights from existing ABSA results",
@@ -843,6 +853,184 @@ async def get_business_reports(place_id: str, db: Session = Depends(get_db)) -> 
         },
         "reports": out,
     }
+
+
+@app.post("/analyze/frameworks/pestel")
+async def analyze_pestel_framework(
+    request: PESTELFrameworkRequest,
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """
+    Dedicated PESTEL API.
+    Optimized path that uses cached DB artifacts only (no new scraping).
+    """
+    start_time = datetime.now()
+
+    try:
+        business_db = crud.get_business_by_name(db, request.business_name, request.city)
+        if not business_db:
+            raise HTTPException(
+                status_code=404,
+                detail="Business not found in DB. Run /analyze/business/insights first.",
+            )
+
+        analysis_db = (
+            crud.get_latest_analysis(db, business_db.id, "absa_full")
+            or crud.get_latest_analysis(db, business_db.id, "absa_with_insights")
+            or crud.get_latest_analysis(db, business_db.id, "absa")
+        )
+        if not analysis_db:
+            raise HTTPException(
+                status_code=400,
+                detail="No ABSA analysis found. Run /analyze/business/insights first.",
+            )
+
+        aggregated_rows = crud.get_aggregated_absa(db, business_db.id)
+        if not aggregated_rows:
+            raise HTTPException(
+                status_code=400,
+                detail="No aggregated ABSA found. Run /analyze/business/insights first.",
+            )
+
+        aggregated = [
+            {
+                "aspect": row.aspect,
+                "overall_sentiment": row.overall_sentiment,
+                "confidence_score": row.confidence_score,
+                "source_breakdown": row.source_breakdown,
+                "conflict_flag": row.conflict_flag,
+                "conflict_detail": row.conflict_detail,
+            }
+            for row in aggregated_rows
+        ]
+
+        reviews = crud.get_reviews_by_business(db, business_db.id)
+        gmap_count = len([r for r in reviews if (r.source or "") == "google_maps" and r.review_text])
+        twitter_count = len([r for r in reviews if (r.source or "") == "twitter" and r.review_text])
+
+        latest_news_rows = crud.get_scraping_results_by_business(db, business_db.id, limit=40)
+        cached_news = [
+            {
+                "headline": n.headline,
+                "source_name": n.source_name,
+                "link": n.link,
+            }
+            for n in latest_news_rows
+        ]
+
+        # Fresh category-specific Google News fetch for better PESTEL balance.
+        pestel_queries = {
+            "political": f"restaurant policy permit regulation {request.city}",
+            "economic": f"restaurant inflation LPG food cost {request.city}",
+            "social": f"restaurant consumer trend dining behavior {request.city}",
+            "technological": f"restaurant delivery app Zomato Swiggy digital ordering {request.city}",
+            "environmental": f"restaurant sustainability waste plastic climate {request.city}",
+            "legal": f"restaurant compliance FSSAI labor license law {request.city}",
+        }
+        fresh_news: List[Dict[str, Any]] = []
+        for _, query_term in pestel_queries.items():
+            try:
+                articles = scrape_google_news(
+                    query_term=query_term,
+                    location=request.city,
+                    max_results=3,
+                    exact_match=False,
+                    include_location=False,
+                )
+                for article in articles:
+                    fresh_news.append(
+                        {
+                            "headline": article.get("headline", ""),
+                            "source_name": article.get("source_name", "Unknown"),
+                            "link": article.get("link"),
+                        }
+                    )
+            except Exception as news_err:
+                logger.warning(f"PESTEL news query failed for '{query_term}': {news_err}")
+
+        # Merge fresh + cached news and dedupe by link/headline.
+        seen_keys = set()
+        news_mentions: List[Dict[str, Any]] = []
+        for n in fresh_news + cached_news:
+            key = n.get("link") or n.get("headline")
+            if not key or key in seen_keys:
+                continue
+            seen_keys.add(key)
+            news_mentions.append(n)
+
+        review_texts = [r.review_text for r in reviews if r.review_text]
+
+        pestel_payload = generate_pestel_framework(
+            aggregated_absa=aggregated,
+            news_mentions=news_mentions,
+            review_texts=review_texts,
+            google_review_count=gmap_count,
+            twitter_review_count=twitter_count,
+        )
+
+        pestel_reports = crud.save_framework_reports(
+            db=db,
+            business_id=business_db.id,
+            analysis_id=analysis_db.id,
+            frameworks={"pestel": pestel_payload},
+            avg_confidence_per_framework={"pestel": float(pestel_payload.get("avg_score_pct", 0))},
+            sources_used=["google_maps", "twitter"] + (["news"] if news_mentions else []),
+        )
+
+        execution_time = int((datetime.now() - start_time).total_seconds() * 1000)
+        crud.log_analysis(
+            db=db,
+            business_name=business_db.name,
+            category="restaurant",
+            location=request.city,
+            endpoint="/analyze/frameworks/pestel",
+            status="success",
+            execution_time_ms=execution_time,
+        )
+
+        return {
+            "status": "success",
+            "business_info": {
+                "name": business_db.name,
+                "area": request.area,
+                "city": request.city,
+                "address": business_db.address,
+                "place_id": business_db.place_id,
+                "months_back": request.months_back,
+            },
+            "summary_stats": {
+                "total_reviews": gmap_count + twitter_count,
+                "avg_rating": business_db.rating,
+                "avg_score": f"{pestel_payload.get('avg_score_pct', 0)}%",
+            },
+            "framework": {
+                "type": "pestel",
+                "avg_score_pct": pestel_payload.get("avg_score_pct", 0),
+                "result_json": pestel_payload,
+            },
+            "execution_time_ms": execution_time,
+            "report_id": pestel_reports[0].id if pestel_reports else None,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"PESTEL framework endpoint error: {e}")
+        execution_time = int((datetime.now() - start_time).total_seconds() * 1000)
+        try:
+            crud.log_analysis(
+                db=db,
+                business_name=request.business_name,
+                category="restaurant",
+                location=request.city,
+                endpoint="/analyze/frameworks/pestel",
+                status="failed",
+                error_message=str(e),
+                execution_time_ms=execution_time,
+            )
+        except Exception:
+            pass
+        raise HTTPException(status_code=500, detail=str(e))
 
 # Generate review response template
 @app.post("/insights/response-template")
