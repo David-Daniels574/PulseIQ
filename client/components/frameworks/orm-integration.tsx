@@ -22,10 +22,11 @@ import {
 } from "@/components/ui/dialog"
 import { Textarea } from "@/components/ui/textarea"
 import { Star, MessageSquare, Clock, TrendingUp, AlertCircle, Send, Sparkles } from "lucide-react"
-import { ormData } from "@/lib/mock-data"
+import { useDashboardData } from "@/hooks/use-dashboard-data"
 import { format } from "date-fns"
 
 export function ORMIntegration() {
+  const { ormData } = useDashboardData()
   const [selectedReview, setSelectedReview] = useState<typeof ormData.reviews[0] | null>(null)
   const [responseText, setResponseText] = useState("")
   const [sentimentFilter, setSentimentFilter] = useState("all")

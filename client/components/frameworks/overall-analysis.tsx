@@ -3,13 +3,7 @@
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
 import { Star, MessageSquare, TrendingUp, Sparkles, Globe, ShieldCheck } from "lucide-react"
-import {
-  sentimentAnalysis,
-  strategicInsights,
-  businessInfo,
-  reviewVolumeData,
-  sourceBreakdownData,
-} from "@/lib/mock-data"
+import { useDashboardData } from "@/hooks/use-dashboard-data"
 import {
   PieChart, Pie, Cell,
   BarChart, Bar,
@@ -35,6 +29,7 @@ const SOURCE_COLORS = [
 ]
 
 export function OverallAnalysis() {
+  const { sentimentAnalysis, strategicInsights, businessInfo, reviewVolumeData, sourceBreakdownData } = useDashboardData()
   const { overall_sentiment, aspects } = sentimentAnalysis
 
   const sentimentPieData = [

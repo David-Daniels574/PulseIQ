@@ -4,7 +4,7 @@ import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/com
 import { Badge } from "@/components/ui/badge"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { TrendingUp, TrendingDown, Minus, ExternalLink, Users, Hash } from "lucide-react"
-import { socialListeningData } from "@/lib/mock-data"
+import { useDashboardData } from "@/hooks/use-dashboard-data"
 import {
   BarChart,
   Bar,
@@ -16,6 +16,7 @@ import {
 } from "recharts"
 
 export function SocialListening() {
+  const { socialListeningData } = useDashboardData()
   const getTrendIcon = (trend: string) => {
     switch (trend) {
       case "up": return <TrendingUp className="h-4 w-4 text-chart-2" />

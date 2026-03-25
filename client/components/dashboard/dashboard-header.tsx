@@ -2,21 +2,21 @@
 
 import { useState, useEffect } from "react"
 import { Bell, CalendarDays, CheckCircle2, ChevronDown, User } from "lucide-react"
-import { businessInfo } from "@/lib/mock-data"
+import { useDashboardData } from "@/hooks/use-dashboard-data"
 
-const PAGE_TITLES: Record<string, { title: string; subtitle: string }> = {
-  overall:         { title: "Overview",             subtitle: businessInfo.name },
-  competitors:     { title: "Competitor Analysis",  subtitle: businessInfo.name },
-  market:          { title: "Market Intelligence",  subtitle: businessInfo.name },
-  swot:            { title: "SWOT Analysis",        subtitle: businessInfo.name },
-  pestel:          { title: "PESTEL Analysis",      subtitle: businessInfo.name },
-  fourps:          { title: "4 P's Framework",      subtitle: businessInfo.name },
-  bcg:             { title: "BCG Matrix",            subtitle: businessInfo.name },
-  ansoff:          { title: "Ansoff Matrix",         subtitle: businessInfo.name },
-  orm:             { title: "ORM Console",           subtitle: businessInfo.name },
-  social:          { title: "Trend Tracker",         subtitle: businessInfo.name },
-  reporting:       { title: "Advanced Reports",      subtitle: businessInfo.name },
-  recommendations: { title: "Action Plan",           subtitle: businessInfo.name },
+const PAGE_TITLES: Record<string, { title: string }> = {
+  overall:         { title: "Overview" },
+  competitors:     { title: "Competitor Analysis" },
+  market:          { title: "Market Intelligence" },
+  swot:            { title: "SWOT Analysis" },
+  pestel:          { title: "PESTEL Analysis" },
+  fourps:          { title: "4 P's Framework" },
+  bcg:             { title: "BCG Matrix" },
+  ansoff:          { title: "Ansoff Matrix" },
+  orm:             { title: "ORM Console" },
+  social:          { title: "Trend Tracker" },
+  reporting:       { title: "Advanced Reports" },
+  recommendations: { title: "Action Plan" },
 }
 
 interface DashboardHeaderProps {
@@ -27,6 +27,7 @@ interface DashboardHeaderProps {
 
 export function DashboardHeader({ activeTab = "overall" }: DashboardHeaderProps) {
   const [mounted, setMounted] = useState(false)
+  const { businessInfo } = useDashboardData()
 
   useEffect(() => {
     setMounted(true)
@@ -45,7 +46,7 @@ export function DashboardHeader({ activeTab = "overall" }: DashboardHeaderProps)
           {page.title}
         </h1>
         <p className="text-[11px] leading-tight truncate" style={{ color: "hsl(var(--text-muted))" }}>
-          {page.subtitle}
+          {businessInfo.name}
         </p>
       </div>
 

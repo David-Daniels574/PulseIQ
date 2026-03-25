@@ -3,7 +3,7 @@
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
 import { Star, DollarSign, HelpCircle, AlertTriangle } from "lucide-react"
-import { bcgMatrixData } from "@/lib/mock-data"
+import { useDashboardData } from "@/hooks/use-dashboard-data"
 
 const quadrantConfig = {
   stars: {
@@ -100,6 +100,7 @@ function QuadrantCard({ type, items }: QuadrantCardProps) {
 }
 
 export function BCGMatrix() {
+  const { bcgMatrixData } = useDashboardData()
   return (
     <div className="space-y-6">
       {/* Header */}

@@ -480,3 +480,136 @@ export const fourPsData = {
   place: { score: 74, summary: "Prime location with strong foot traffic and transit access. Physical ambiance is a competitive strength.", highlights: ["Location generates organic walk-in traffic from neighborhood foot traffic", "Interior design cited as a reason to visit by 28% of reviewers", "Close to transit improves accessibility for non-driving diners"], gaps: ["No dedicated parking — limits suburban and outer-borough visitors", "Delivery radius is limited and experience is subpar", "Online presence (Twitter, Google) photos are outdated"] },
   promotion: { score: 57, summary: "Offline presence is strong but digital and social media strategy is significantly underdeveloped.", highlights: ["Media coverage in NYT Food and Eater NY drives awareness", "Strong word-of-mouth with 40% of new customers via referral", "Chef's personal brand adds credibility"], gaps: ["No TikTok presence despite viral potential of food content", "Twitter posts averaging 3x lower engagement than competitor set", "Email marketing list underutilized — last campaign was 4 months ago", "Zero paid social media advertising"] }
 }
+
+export type InsightsPayload = {
+  business_info?: {
+    name?: string
+    address?: string
+  }
+  summary_stats?: {
+    total_reviews?: number
+    avg_rating?: number
+    media_mentions?: number
+    overall_confidence?: number
+  }
+  sentiment_breakdown?: {
+    positive?: number
+    neutral?: number
+    negative?: number
+  }
+  source_breakdown?: Record<string, Record<string, unknown>>
+  review_volume_trend?: Array<{ month: string; count: number }>
+  top_keywords?: Array<{ keyword: string; count: number }>
+  aspect_sentiment?: Array<{
+    aspect: string
+    overall_sentiment: "Positive" | "Negative" | "Neutral"
+    confidence_score: number
+    mention_count?: number
+  }>
+}
+
+function normalizeMonth(monthValue: string): string {
+  const date = new Date(`${monthValue}-01T00:00:00`)
+  if (Number.isNaN(date.getTime())) return monthValue
+  return date.toLocaleString("en-US", { month: "short" })
+}
+
+function titleCase(value: string): string {
+  return value
+    .replace(/_/g, " ")
+    .replace(/\b\w/g, (m) => m.toUpperCase())
+}
+
+export function applyInsightsToDashboard(payload: InsightsPayload) {
+  const positive = Math.round(payload.sentiment_breakdown?.positive ?? 0)
+  const neutral = Math.round(payload.sentiment_breakdown?.neutral ?? 0)
+  const negative = Math.round(payload.sentiment_breakdown?.negative ?? 0)
+
+  if (payload.business_info?.name) businessInfo.name = payload.business_info.name
+  if (payload.business_info?.address) businessInfo.address = payload.business_info.address
+  if (typeof payload.summary_stats?.avg_rating === "number") {
+    businessInfo.rating = Number(payload.summary_stats.avg_rating.toFixed(2))
+  }
+  if (typeof payload.summary_stats?.total_reviews === "number") {
+    businessInfo.total_ratings = payload.summary_stats.total_reviews
+    businessInfo.reviews_analyzed = payload.summary_stats.total_reviews
+  }
+  if (typeof payload.summary_stats?.media_mentions === "number") {
+    businessInfo.mediaMentions = payload.summary_stats.media_mentions
+  }
+  if (typeof payload.summary_stats?.overall_confidence === "number") {
+    businessInfo.confidenceScore = Math.round(payload.summary_stats.overall_confidence)
+  }
+  businessInfo.lastUpdated = new Date().toISOString()
+
+  sentimentAnalysis.overall_sentiment = {
+    sentiment: positive >= negative ? "Positive" : "Negative",
+    positive_percentage: positive,
+    negative_percentage: negative,
+    neutral_percentage: neutral,
+  }
+
+  const aspectsTarget = sentimentAnalysis.aspects as unknown as Record<string, {
+    total_mentions: number
+    sentiment_breakdown: { Positive: number; Negative: number; Neutral: number }
+    average_confidence: number
+    overall_sentiment: string
+  }>
+
+  for (const key of Object.keys(aspectsTarget)) {
+    delete aspectsTarget[key]
+  }
+
+  for (const item of payload.aspect_sentiment ?? []) {
+    const mentions = item.mention_count ?? 0
+    const p = item.overall_sentiment === "Positive" ? mentions : 0
+    const n = item.overall_sentiment === "Negative" ? mentions : 0
+    const u = item.overall_sentiment === "Neutral" ? mentions : 0
+    aspectsTarget[item.aspect] = {
+      total_mentions: mentions,
+      sentiment_breakdown: { Positive: p, Negative: n, Neutral: u },
+      average_confidence: Number(item.confidence_score.toFixed(2)),
+      overall_sentiment: item.overall_sentiment,
+    }
+  }
+
+  const trend = (payload.review_volume_trend ?? []).map((row) => {
+    const posCount = Math.round((row.count * positive) / 100)
+    const negCount = Math.round((row.count * negative) / 100)
+    const neuCount = Math.max(0, row.count - posCount - negCount)
+    return {
+      month: normalizeMonth(row.month),
+      total: row.count,
+      positive: posCount,
+      negative: negCount,
+      neutral: neuCount,
+    }
+  })
+  if (trend.length > 0) {
+    reviewVolumeData.splice(0, reviewVolumeData.length, ...trend)
+  }
+
+  const sourceEntries = Object.entries(payload.source_breakdown ?? {})
+  const totalCount = sourceEntries.reduce((sum, [, value]) => {
+    const count = Number((value.review_count as number) ?? (value.article_count as number) ?? 0)
+    return sum + (Number.isFinite(count) ? count : 0)
+  }, 0)
+  const mappedSources = sourceEntries
+    .map(([source, value]) => {
+      const count = Number((value.review_count as number) ?? (value.article_count as number) ?? 0)
+      const percentage = totalCount > 0 ? Math.round((count / totalCount) * 100) : 0
+      return { source: titleCase(source), count, percentage }
+    })
+    .filter((row) => row.count > 0)
+  if (mappedSources.length > 0) {
+    sourceBreakdownData.splice(0, sourceBreakdownData.length, ...mappedSources)
+  }
+
+  if ((payload.top_keywords ?? []).length > 0) {
+    const tops = payload.top_keywords ?? []
+    bcgMatrixData.stars = tops.slice(0, 3).map((x) => ({ name: x.keyword, mentions: x.count, sentimentAvg: 4.7 }))
+    bcgMatrixData.cashCows = tops.slice(3, 6).map((x) => ({ name: x.keyword, mentions: x.count, sentimentAvg: 4.3 }))
+    bcgMatrixData.questionMarks = tops.slice(6, 8).map((x) => ({ name: x.keyword, mentions: x.count, sentimentAvg: 3.8 }))
+    bcgMatrixData.dogs = tops.slice(8, 10).map((x) => ({ name: x.keyword, mentions: x.count, sentimentAvg: 3.0 }))
+  }
+}

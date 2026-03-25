@@ -21,7 +21,7 @@ import {
   Globe2,
 } from "lucide-react"
 import { cn } from "@/lib/utils"
-import { businessInfo } from "@/lib/mock-data"
+import { useDashboardData } from "@/hooks/use-dashboard-data"
 
 const navGroups = [
   {
@@ -70,12 +70,16 @@ function SidebarContent({
   onTabChange,
   collapsed,
   setCollapsed,
+  businessName,
+  businessCategory,
   onMobileClose,
 }: {
   activeTab: string
   onTabChange: (id: string) => void
   collapsed: boolean
   setCollapsed: (v: boolean) => void
+  businessName: string
+  businessCategory: string
   onMobileClose?: () => void
 }) {
   const handleSelect = (id: string) => {
@@ -121,14 +125,14 @@ function SidebarContent({
         <div className="shrink-0 border-b border-sidebar-border px-4 py-3">
           <div className="flex items-center gap-2.5">
             <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-sidebar-accent text-sm font-semibold text-sidebar-foreground">
-              {businessInfo.name.charAt(0)}
+              {businessName.charAt(0)}
             </div>
             <div className="min-w-0 flex-1">
               <p className="truncate text-[13px] font-semibold leading-tight text-sidebar-foreground">
-                {businessInfo.name}
+                {businessName}
               </p>
               <p className="truncate text-[11px] leading-tight text-sidebar-muted-foreground mt-0.5">
-                {businessInfo.category}
+                {businessCategory}
               </p>
             </div>
           </div>
@@ -234,6 +238,7 @@ export function DashboardSidebar({
   mobileOpen,
   onMobileClose,
 }: DashboardSidebarProps) {
+  const { businessInfo } = useDashboardData()
   const [collapsed, setCollapsed] = useState(false)
 
   return (
@@ -250,6 +255,8 @@ export function DashboardSidebar({
           onTabChange={onTabChange}
           collapsed={collapsed}
           setCollapsed={setCollapsed}
+          businessName={businessInfo.name}
+          businessCategory={businessInfo.category}
         />
       </aside>
 
@@ -267,6 +274,8 @@ export function DashboardSidebar({
               onTabChange={onTabChange}
               collapsed={false}
               setCollapsed={() => {}}
+              businessName={businessInfo.name}
+              businessCategory={businessInfo.category}
               onMobileClose={onMobileClose}
             />
           </aside>

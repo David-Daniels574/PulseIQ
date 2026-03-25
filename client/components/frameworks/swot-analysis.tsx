@@ -4,7 +4,15 @@ import { useState } from "react"
 import { motion } from "framer-motion"
 import { TrendingUp, TrendingDown, Zap, AlertTriangle, ExternalLink } from "lucide-react"
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog"
-import { swotData, type SwotItem } from "@/lib/mock-data"
+import { useDashboardData } from "@/hooks/use-dashboard-data"
+
+type SwotItem = {
+  text: string
+  confidence: "High" | "Medium" | "Low"
+  platform: string
+  sourceText: string
+  sourceUrl: string
+}
 
 const stagger = { animate: { transition: { staggerChildren: 0.06 } } }
 const fadeUp = { initial: { opacity: 0, y: 12 }, animate: { opacity: 1, y: 0 } }
@@ -22,6 +30,7 @@ function ConfidenceBadge({ level }: { level: "High" | "Medium" | "Low" }) {
 }
 
 export function SwotAnalysis() {
+  const { swotData } = useDashboardData()
   const [selectedSource, setSelectedSource] = useState<SwotItem | null>(null)
 
   const allItems = [...swotData.strengths, ...swotData.weaknesses, ...swotData.opportunities, ...swotData.threats]

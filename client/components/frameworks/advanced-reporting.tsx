@@ -4,7 +4,7 @@ import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/com
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { FileDown, AlertTriangle, CheckCircle, TrendingUp, Calendar } from "lucide-react"
-import { advancedReportingData } from "@/lib/mock-data"
+import { useDashboardData } from "@/hooks/use-dashboard-data"
 import {
   LineChart,
   Line,
@@ -21,6 +21,7 @@ import {
 const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
 
 export function AdvancedReporting() {
+  const { advancedReportingData } = useDashboardData()
   const heatmapData = Object.entries(advancedReportingData.seasonalPatterns).map(([aspect, values]) => ({
     aspect,
     values: values as number[]

@@ -1,7 +1,15 @@
 "use client"
 
 import { motion } from "framer-motion"
-import { pestelData, type PestelItem } from "@/lib/mock-data"
+import { useDashboardData } from "@/hooks/use-dashboard-data"
+
+type PestelItem = {
+  factor: string
+  impact: "Positive" | "Negative" | "Neutral"
+  severity: "High" | "Medium" | "Low"
+  description: string
+  implication: string
+}
 
 const stagger = { animate: { transition: { staggerChildren: 0.05 } } }
 const fadeUp = { initial: { opacity: 0, y: 12 }, animate: { opacity: 1, y: 0 } }
@@ -24,6 +32,7 @@ function SeverityDot({ severity }: { severity: PestelItem["severity"] }) {
 }
 
 export function PestelFramework() {
+  const { pestelData } = useDashboardData()
   return (
     <div className="space-y-5">
       {/* Header card */}

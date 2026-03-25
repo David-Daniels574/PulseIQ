@@ -3,7 +3,7 @@
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
 import { Megaphone, Clock, DollarSign, Newspaper, TrendingUp, Sparkles, Target, CheckCircle2 } from "lucide-react"
-import { recommendations } from "@/lib/mock-data"
+import { useDashboardData } from "@/hooks/use-dashboard-data"
 
 const categoryIcons: Record<string, React.ElementType> = {
   Marketing: Megaphone,
@@ -28,6 +28,7 @@ const categoryColors: Record<string, string> = {
 }
 
 export function Recommendations() {
+  const { recommendations } = useDashboardData()
   const highPriorityCount = recommendations.filter(r => r.priority === "High").length
   const totalSteps = recommendations.reduce((acc, r) => acc + r.steps.length, 0)
 

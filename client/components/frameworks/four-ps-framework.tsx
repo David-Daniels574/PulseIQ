@@ -2,7 +2,7 @@
 
 import { motion } from "framer-motion"
 import { Package, DollarSign, MapPin, Megaphone, CheckCircle2, XCircle } from "lucide-react"
-import { fourPsData } from "@/lib/mock-data"
+import { useDashboardData } from "@/hooks/use-dashboard-data"
 
 const stagger = { animate: { transition: { staggerChildren: 0.07 } } }
 const fadeUp = { initial: { opacity: 0, y: 12 }, animate: { opacity: 1, y: 0 } }
@@ -67,6 +67,7 @@ function ScoreRing({ score, color }: { score: number; color: string }) {
 }
 
 export function FourPsFramework() {
+  const { fourPsData } = useDashboardData()
   const avgScore = Math.round(
     Object.values(fourPsData).reduce((s, d) => s + d.score, 0) / 4
   )

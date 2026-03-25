@@ -4,7 +4,7 @@ import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/com
 import { Badge } from "@/components/ui/badge"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { Star, TrendingUp, TrendingDown, Minus, MapPin } from "lucide-react"
-import { competitorData } from "@/lib/mock-data"
+import { useDashboardData } from "@/hooks/use-dashboard-data"
 import {
   ScatterChart,
   Scatter,
@@ -21,6 +21,7 @@ import {
 } from "recharts"
 
 export function CompetitorAnalysis() {
+  const { competitorData } = useDashboardData()
   const { main_business, competitors, competitive_analysis, aspect_showdown } = competitorData
 
   // Scatter plot data
@@ -142,7 +143,7 @@ export function CompetitorAnalysis() {
                     name === 'x' ? value.toLocaleString() : value.toFixed(1),
                     name === 'x' ? 'Reviews' : 'Rating'
                   ]}
-                  labelFormatter={(_, payload) => payload[0]?.payload?.name || ''}
+                  labelFormatter={(_, payload: any[]) => payload?.[0]?.payload?.name || ''}
                 />
                 <Scatter data={scatterData}>
                   {scatterData.map((entry, index) => (

@@ -3,7 +3,7 @@
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
 import { Target, Lightbulb, Globe, Rocket, AlertCircle, TrendingUp } from "lucide-react"
-import { ansoffMatrixData } from "@/lib/mock-data"
+import { useDashboardData } from "@/hooks/use-dashboard-data"
 
 const quadrantConfig = {
   marketPenetration: {
@@ -111,6 +111,7 @@ function StrategyCard({ type, data }: StrategyCardProps) {
 }
 
 export function AnsoffMatrix() {
+  const { ansoffMatrixData } = useDashboardData()
   return (
     <div className="space-y-6">
       {/* Header */}
