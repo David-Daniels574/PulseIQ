@@ -19,6 +19,7 @@ import {
   TrendingUp,
   ShoppingBag,
   Globe2,
+  Boxes,
 } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { useDashboardData } from "@/hooks/use-dashboard-data"
@@ -40,6 +41,7 @@ const navGroups = [
       { id: "fourps", label: "4 P's Framework",  icon: ShoppingBag, description: "Product, Price, Place, Promotion" },
       { id: "bcg",    label: "BCG Matrix",       icon: Grid3X3,     description: "Menu portfolio analysis" },
       { id: "ansoff", label: "Ansoff Matrix",    icon: Target,      description: "Growth strategy planning" },
+      { id: "mece",   label: "MECE Framework",   icon: Boxes,       description: "Complaint buckets (ME + CE)" },
     ],
   },
   {

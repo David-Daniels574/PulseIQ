@@ -35,6 +35,8 @@ export function SwotAnalysis() {
 
   const allItems = [...swotData.strengths, ...swotData.weaknesses, ...swotData.opportunities, ...swotData.threats]
   const highCount = allItems.filter((i) => i.confidence === "High").length
+  const confidencePct = Math.max(0, Math.min(100, Number(swotData.confidencePct ?? 0)))
+  const totalReviews = Number(swotData.totalReviews ?? 0)
 
   return (
     <div className="space-y-5">
@@ -44,14 +46,14 @@ export function SwotAnalysis() {
           <p className="text-xs font-semibold uppercase tracking-wider" style={{ color: "hsl(var(--text-muted))" }}>
             SWOT Confidence
           </p>
-          <p className="font-serif text-2xl font-bold" style={{ color: "hsl(var(--accent))" }}>84%</p>
+          <p className="font-serif text-2xl font-bold" style={{ color: "hsl(var(--accent))" }}>{confidencePct}%</p>
         </div>
         <div className="flex-1">
           <div className="h-2 rounded-full overflow-hidden" style={{ backgroundColor: "hsl(var(--bg-elevated))" }}>
-            <div className="h-full rounded-full transition-all duration-700" style={{ width: "84%", backgroundColor: "hsl(var(--accent))" }} />
+            <div className="h-full rounded-full transition-all duration-700" style={{ width: `${confidencePct}%`, backgroundColor: "hsl(var(--accent))" }} />
           </div>
           <p className="text-xs mt-1" style={{ color: "hsl(var(--text-muted))" }}>
-            {highCount} of {allItems.length} insights rated High confidence · Derived from 847 reviews
+            {highCount} of {allItems.length} insights rated High confidence · Derived from {totalReviews} reviews
           </p>
         </div>
       </div>

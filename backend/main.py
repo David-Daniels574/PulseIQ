@@ -32,6 +32,7 @@ from services.confidence_engine import (
 from services.framework_llm import generate_all_frameworks
 from services.agentic_swot import generate_agentic_swot
 from services.agentic_pestel import generate_pestel_framework
+from services.agentic_mece import generate_mece_framework
 
 
 from analyzer import (
@@ -167,6 +168,7 @@ class SWOTFrameworkRequest(BaseModel):
     business_name: str = Field(..., description="Name of the restaurant")
     area: str = Field(..., description="Area/neighbourhood e.g. 'Colaba'")
     city: str = Field(..., description="City e.g. 'Mumbai'")
+    place_id: Optional[str] = Field(None, description="Optional Google Maps place_id for direct lookup (if provided, used instead of name-based lookup)")
     twitter_query: Optional[str] = Field(None, description="Optional specific query for Twitter. Defaults to business name + city.")
     months_back: Optional[int] = Field(6, ge=1, le=24, description="How many months of data to include (default 6)")
 
@@ -176,6 +178,16 @@ class PESTELFrameworkRequest(BaseModel):
     business_name: str = Field(..., description="Name of the restaurant")
     area: str = Field(..., description="Area/neighbourhood e.g. 'Colaba'")
     city: str = Field(..., description="City e.g. 'Mumbai'")
+    place_id: Optional[str] = Field(None, description="Optional Google Maps place_id for direct lookup (if provided, used instead of name-based lookup)")
+    months_back: Optional[int] = Field(6, ge=1, le=24, description="How many months of data to include (default 6)")
+
+
+class MECEFrameworkRequest(BaseModel):
+    """Request for dedicated MECE complaint framework generation"""
+    business_name: str = Field(..., description="Name of the restaurant")
+    area: str = Field(..., description="Area/neighbourhood e.g. 'Colaba'")
+    city: str = Field(..., description="City e.g. 'Mumbai'")
+    product_focus: Optional[str] = Field("pizzas", description="Product lens for recommendations (default: pizzas)")
     months_back: Optional[int] = Field(6, ge=1, le=24, description="How many months of data to include (default 6)")
  
 class CompetitorRequest(BaseModel):
@@ -269,6 +281,7 @@ async def root():
             "/analyze/business/insights": "POST - Fetch reviews, analyze, AND generate strategic insights (STORED IN DB)",
             "/analyze/frameworks/swot": "POST - Generate SWOT framework with source citations",
             "/analyze/frameworks/pestel": "POST - Generate PESTEL + 4P framework from cached DB data",
+            "/analyze/frameworks/mece": "POST - Generate MECE complaint framework from pre-clustered buckets",
             "/analyze/competitors": "POST - Find and analyze top 4 competitors in your area",
             "/market-intelligence": "POST - Star-rating forecast + industry trend and market news",
             "/insights/generate": "POST - Generate insights from existing ABSA results",
@@ -641,7 +654,12 @@ async def analyze_swot_framework(
     start_time = datetime.now()
 
     try:
-        business_db = crud.get_business_by_name(db, request.business_name, request.city)
+        # Try place_id lookup first (most reliable), fallback to name-based lookup
+        if request.place_id:
+            business_db = crud.get_business_by_place_id(db, request.place_id)
+        else:
+            business_db = crud.get_business_by_name(db, request.business_name, request.city)
+        
         if not business_db:
             raise HTTPException(
                 status_code=404,
@@ -867,7 +885,12 @@ async def analyze_pestel_framework(
     start_time = datetime.now()
 
     try:
-        business_db = crud.get_business_by_name(db, request.business_name, request.city)
+        # Try place_id lookup first (most reliable), fallback to name-based lookup
+        if request.place_id:
+            business_db = crud.get_business_by_place_id(db, request.place_id)
+        else:
+            business_db = crud.get_business_by_name(db, request.business_name, request.city)
+
         if not business_db:
             raise HTTPException(
                 status_code=404,
@@ -1024,6 +1047,117 @@ async def analyze_pestel_framework(
                 category="restaurant",
                 location=request.city,
                 endpoint="/analyze/frameworks/pestel",
+                status="failed",
+                error_message=str(e),
+                execution_time_ms=execution_time,
+            )
+        except Exception:
+            pass
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/analyze/frameworks/mece")
+async def analyze_mece_framework(
+    request: MECEFrameworkRequest,
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """
+    Dedicated MECE API.
+    Uses pre-clustered complaint buckets from AggregatedABSA and applies
+    ME/CE refinement (rename/merge/describe).
+    """
+    start_time = datetime.now()
+
+    try:
+        business_db = crud.get_business_by_name(db, request.business_name, request.city)
+        if not business_db:
+            raise HTTPException(
+                status_code=404,
+                detail="Business not found in DB. Run /analyze/business/insights first.",
+            )
+
+        analysis_db = (
+            crud.get_latest_analysis(db, business_db.id, "absa_full")
+            or crud.get_latest_analysis(db, business_db.id, "absa_with_insights")
+            or crud.get_latest_analysis(db, business_db.id, "absa")
+        )
+        if not analysis_db:
+            raise HTTPException(
+                status_code=400,
+                detail="No ABSA analysis found. Run /analyze/business/insights first.",
+            )
+
+        mece_clusters = crud.get_mece_clusters(db, business_db.id) or []
+        if not mece_clusters:
+            raise HTTPException(
+                status_code=400,
+                detail="No MECE pre-clusters found. Run /analyze/business/insights first.",
+            )
+
+        mece_payload = generate_mece_framework(
+            business_name=business_db.name,
+            city=request.city,
+            mece_clusters=mece_clusters,
+            product_focus=(request.product_focus or "pizzas").strip() or "pizzas",
+        )
+
+        mece_reports = crud.save_framework_reports(
+            db=db,
+            business_id=business_db.id,
+            analysis_id=analysis_db.id,
+            frameworks={"mece": mece_payload},
+            avg_confidence_per_framework={"mece": float(mece_payload.get("avg_score_pct", 0))},
+            sources_used=["google_maps", "twitter"],
+        )
+
+        total_reviews = int(analysis_db.total_reviews_analyzed or 0)
+        execution_time = int((datetime.now() - start_time).total_seconds() * 1000)
+        crud.log_analysis(
+            db=db,
+            business_name=business_db.name,
+            category="restaurant",
+            location=request.city,
+            endpoint="/analyze/frameworks/mece",
+            status="success",
+            execution_time_ms=execution_time,
+        )
+
+        return {
+            "status": "success",
+            "business_info": {
+                "name": business_db.name,
+                "area": request.area,
+                "city": request.city,
+                "address": business_db.address,
+                "place_id": business_db.place_id,
+                "months_back": request.months_back,
+            },
+            "summary_stats": {
+                "total_reviews": total_reviews,
+                "avg_rating": business_db.rating,
+                "avg_score": f"{mece_payload.get('avg_score_pct', 0)}%",
+            },
+            "framework": {
+                "type": "mece",
+                "avg_score_pct": mece_payload.get("avg_score_pct", 0),
+                "result_json": mece_payload,
+            },
+            "execution_time_ms": execution_time,
+            "report_id": mece_reports[0].id if mece_reports else None,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"MECE framework endpoint error: {e}")
+        execution_time = int((datetime.now() - start_time).total_seconds() * 1000)
+        try:
+            crud.log_analysis(
+                db=db,
+                business_name=request.business_name,
+                category="restaurant",
+                location=request.city,
+                endpoint="/analyze/frameworks/mece",
                 status="failed",
                 error_message=str(e),
                 execution_time_ms=execution_time,

@@ -9,9 +9,15 @@ import {
   DashboardData,
   getBusinessInsights,
   getCompetitorInsights,
+  getSwotFramework,
+  getPestelFramework,
+  getMeceFramework,
   getMarketIntelligence,
   mapCompetitorToDashboardData,
   mapInsightsToDashboardData,
+  mapSwotFrameworkToDashboardFields,
+  mapPestelFrameworkToDashboardFields,
+  mapMeceFrameworkToDashboardFields,
   mapMarketIntelligenceToDashboardFields,
 } from "@/services/dashboard.service"
 
@@ -24,6 +30,7 @@ import { AnsoffMatrix } from "@/components/frameworks/ansoff-matrix"
 import { SwotAnalysis } from "@/components/frameworks/swot-analysis"
 import { PestelFramework } from "@/components/frameworks/pestel-framework"
 import { FourPsFramework } from "@/components/frameworks/four-ps-framework"
+import { MeceFramework } from "@/components/frameworks/mece-framework"
 import { ORMIntegration } from "@/components/frameworks/orm-integration"
 import { SocialListening } from "@/components/frameworks/social-listening"
 import { AdvancedReporting } from "@/components/frameworks/advanced-reporting"
@@ -36,6 +43,7 @@ const contentMap: Record<string, React.ReactNode> = {
   swot:            <SwotAnalysis />,
   pestel:          <PestelFramework />,
   fourps:          <FourPsFramework />,
+  mece:            <MeceFramework />,
   bcg:             <BCGMatrix />,
   ansoff:          <AnsoffMatrix />,
   orm:             <ORMIntegration />,
@@ -83,6 +91,52 @@ export default function DashboardPage() {
       mappedDashboard.competitorData = mapCompetitorToDashboardData(competitorInsights)
       setDashboardData(mappedDashboard)
       setHasSearched(true)
+
+      // Extract place_id from insights for framework endpoint lookups
+      const placeId = insights.business_info?.place_id
+
+      // Fire SWOT framework call non-blocking — updates when ready
+      void getSwotFramework({
+        business_name: name,
+        area: areaVal,
+        city: cityVal,
+        place_id: placeId,
+        twitter_query: normalizedTwitterQuery,
+        months_back: parseInt(months) || 2,
+      })
+        .then((swotResp) => {
+          const swotFields = mapSwotFrameworkToDashboardFields(swotResp)
+          setDashboardData((prev) => (prev ? { ...prev, ...swotFields } : prev))
+        })
+        .catch((err) => console.error("SWOT fetch failed:", err))
+
+      // Fire PESTEL framework call non-blocking — updates when ready
+      void getPestelFramework({
+        business_name: name,
+        area: areaVal,
+        city: cityVal,
+        place_id: placeId,
+        months_back: parseInt(months) || 2,
+      })
+        .then((pestelResp) => {
+          const pestelFields = mapPestelFrameworkToDashboardFields(pestelResp)
+          setDashboardData((prev) => (prev ? { ...prev, ...pestelFields } : prev))
+        })
+        .catch((err) => console.error("PESTEL fetch failed:", err))
+
+      // Fire MECE framework call non-blocking — updates when ready
+      void getMeceFramework({
+        business_name: name,
+        area: areaVal,
+        city: cityVal,
+        product_focus: "pizzas",
+        months_back: parseInt(months) || 2,
+      })
+        .then((meceResp) => {
+          const meceFields = mapMeceFrameworkToDashboardFields(meceResp)
+          setDashboardData((prev) => (prev ? { ...prev, ...meceFields } : prev))
+        })
+        .catch((err) => console.error("MECE fetch failed:", err))
 
       // Fire market-intelligence call non-blocking — updates forecast + news when ready
       setIsMarketLoading(true)

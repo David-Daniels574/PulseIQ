@@ -61,9 +61,11 @@ def _build_swot_candidates(
 ) -> Dict[str, List[Dict[str, Any]]]:
     strengths: List[Dict[str, Any]] = []
     weaknesses: List[Dict[str, Any]] = []
+    all_aspect_candidates: List[Dict[str, Any]] = []
 
     for row in aggregated_absa:
         c = _candidate_from_aspect(row)
+        all_aspect_candidates.append(c)
         if c["sentiment"] == "Positive":
             strengths.append(c)
         elif c["sentiment"] == "Negative":
@@ -88,6 +90,16 @@ def _build_swot_candidates(
                     "base_confidence": min(95.0, 60.0 + abs(rating_delta) * 10.0),
                     "conflict": False,
                     "reason": f"{comp_name} trails by {rating_delta:.2f} rating points; room to capture share.",
+                }
+            )
+        elif rating_delta >= -0.20 and comp_rating > 0:
+            opportunities.append(
+                {
+                    "aspect": "Winnable Segment",
+                    "sentiment": "Positive",
+                    "base_confidence": min(90.0, 58.0 + max(0.0, (0.20 + rating_delta) * 35.0)),
+                    "conflict": False,
+                    "reason": f"{comp_name} is near parity; focused execution can convert this into market-share gain.",
                 }
             )
         elif comp_rating > 0:
@@ -135,8 +147,60 @@ def _build_swot_candidates(
                 }
             )
 
+    # Ensure weaknesses are never empty: use conflict-prone or lowest-confidence aspects.
+    if not weaknesses and all_aspect_candidates:
+        conflicted = [c for c in all_aspect_candidates if bool(c.get("conflict", False))]
+        if conflicted:
+            fallback = sorted(conflicted, key=lambda x: x["base_confidence"])[0]
+            weaknesses.append(
+                {
+                    "aspect": f"{fallback['aspect']} Consistency Risk",
+                    "sentiment": "Negative",
+                    "base_confidence": max(35.0, min(78.0, 100.0 - float(fallback["base_confidence"]))),
+                    "conflict": True,
+                    "reason": f"{fallback['aspect']} has conflicting customer signals; consistency issues can hurt repeat visits.",
+                }
+            )
+        else:
+            weakest = sorted(all_aspect_candidates, key=lambda x: x["base_confidence"])[0]
+            weaknesses.append(
+                {
+                    "aspect": f"{weakest['aspect']} Improvement Area",
+                    "sentiment": "Negative",
+                    "base_confidence": max(35.0, min(72.0, 95.0 - float(weakest["base_confidence"]))),
+                    "conflict": False,
+                    "reason": f"{weakest['aspect']} confidence is comparatively low; service standardization is needed to reduce negative surprises.",
+                }
+            )
+
+    # Ensure opportunities are never empty: leverage strongest internal aspect if no external gap/news signal is found.
+    if not opportunities:
+        if strengths:
+            anchor = strengths[0]
+            opportunities.append(
+                {
+                    "aspect": "Strength-Led Growth",
+                    "sentiment": "Positive",
+                    "base_confidence": min(88.0, 55.0 + float(anchor["base_confidence"]) * 0.35),
+                    "conflict": False,
+                    "reason": f"Leverage strong {anchor['aspect']} perception for premium combos and targeted campaigns to unlock incremental demand.",
+                }
+            )
+        elif all_aspect_candidates:
+            anchor = sorted(all_aspect_candidates, key=lambda x: x["base_confidence"], reverse=True)[0]
+            opportunities.append(
+                {
+                    "aspect": "Execution Upside",
+                    "sentiment": "Positive",
+                    "base_confidence": 60.0,
+                    "conflict": False,
+                    "reason": f"Improve execution around {anchor['aspect']} to convert existing mention volume into stronger repeat business.",
+                }
+            )
+
     opportunities = sorted(opportunities, key=lambda x: x["base_confidence"], reverse=True)[:3]
     threats = sorted(threats, key=lambda x: x["base_confidence"], reverse=True)[:3]
+    weaknesses = sorted(weaknesses, key=lambda x: x["base_confidence"], reverse=True)[:3]
 
     return {
         "strengths": strengths,

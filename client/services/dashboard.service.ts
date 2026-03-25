@@ -186,6 +186,8 @@ export type DashboardData = {
     weaknesses: Array<{ text: string; confidence: "High" | "Medium" | "Low"; platform: string; sourceText: string; sourceUrl: string }>
     opportunities: Array<{ text: string; confidence: "High" | "Medium" | "Low"; platform: string; sourceText: string; sourceUrl: string }>
     threats: Array<{ text: string; confidence: "High" | "Medium" | "Low"; platform: string; sourceText: string; sourceUrl: string }>
+    confidencePct: number
+    totalReviews: number
   }
   pestelData: Record<string, { label: string; color: string; items: Array<{ factor: string; impact: "Positive" | "Negative" | "Neutral"; severity: "High" | "Medium" | "Low"; description: string; implication: string }> }>
   fourPsData: {
@@ -193,6 +195,19 @@ export type DashboardData = {
     price: { score: number; summary: string; highlights: string[]; gaps: string[] }
     place: { score: number; summary: string; highlights: string[]; gaps: string[] }
     promotion: { score: number; summary: string; highlights: string[]; gaps: string[] }
+  }
+  meceData: {
+    avg_score_pct: number
+    product_focus: string
+    is_exhaustive_note: string
+    complaint_categories: Array<{
+      category: string
+      description: string
+      count: number
+      examples: string[]
+      confidence: number
+      sources: string[]
+    }>
   }
 }
 
@@ -281,7 +296,7 @@ const EMPTY_DASHBOARD_DATA: DashboardData = {
     alerts: [],
   },
   recommendations: [],
-  swotData: { strengths: [], weaknesses: [], opportunities: [], threats: [] },
+  swotData: { strengths: [], weaknesses: [], opportunities: [], threats: [], confidencePct: 0, totalReviews: 0 },
   pestelData: {
     political: { label: "Political", color: "hsl(213 93% 68%)", items: [] },
     economic: { label: "Economic", color: "hsl(38 82% 58%)", items: [] },
@@ -295,6 +310,12 @@ const EMPTY_DASHBOARD_DATA: DashboardData = {
     price: { score: 0, summary: "", highlights: [], gaps: [] },
     place: { score: 0, summary: "", highlights: [], gaps: [] },
     promotion: { score: 0, summary: "", highlights: [], gaps: [] },
+  },
+  meceData: {
+    avg_score_pct: 0,
+    product_focus: "pizzas",
+    is_exhaustive_note: "",
+    complaint_categories: [],
   },
 }
 
@@ -359,10 +380,250 @@ export type MarketIntelligenceAPIResponse = {
   }
 }
 
+export type MeceFrameworkRequest = {
+  business_name: string
+  area: string
+  city: string
+  product_focus?: string
+  months_back?: number
+}
+
+export type MeceFrameworkAPIResponse = {
+  status: string
+  framework?: {
+    type?: string
+    avg_score_pct?: number
+    result_json?: {
+      avg_score_pct?: number
+      product_focus?: string
+      is_exhaustive_note?: string
+      complaint_categories?: Array<{
+        category?: string
+        description?: string
+        count?: number
+        examples?: string[]
+        confidence?: number
+        sources?: string[]
+      }>
+    }
+  }
+}
+
+export type SwotFrameworkRequest = {
+  business_name: string
+  area: string
+  city: string
+  place_id?: string
+  twitter_query?: string
+  months_back?: number
+}
+
+type SwotCitation = {
+  source_type?: string
+  source_strength?: string
+  quote?: string
+  source_reference?: string
+  source_url?: string | null
+}
+
+type SwotPoint = {
+  point_id?: string
+  label?: string
+  suggestion?: string
+  confidence_pct?: number
+  derived_insight?: string
+  source_citation?: SwotCitation
+}
+
+export type SwotFrameworkAPIResponse = {
+  status: string
+  summary_stats?: {
+    total_reviews?: number
+    avg_rating?: number
+  }
+  framework?: {
+    type?: string
+    confidence_pct?: number
+    result_json?: {
+      strengths?: SwotPoint[]
+      weaknesses?: SwotPoint[]
+      opportunities?: SwotPoint[]
+      threats?: SwotPoint[]
+    }
+  }
+}
+
+export type PestelFrameworkRequest = {
+  business_name: string
+  area: string
+  city: string
+  place_id?: string
+  months_back?: number
+}
+
+type PestelFactor = {
+  title?: string
+  sentiment?: string
+  severity?: string
+  summary?: string
+  implication?: string
+}
+
+type PestelCategoryPayload = {
+  score_pct?: number
+  factor_count?: number
+  factors?: PestelFactor[]
+}
+
+export type PestelFrameworkAPIResponse = {
+  status: string
+  framework?: {
+    type?: string
+    avg_score_pct?: number
+    result_json?: {
+      avg_score_pct?: number
+      factors_count?: number
+      virality_score_pct?: number
+      categories?: {
+        political?: PestelCategoryPayload
+        economic?: PestelCategoryPayload
+        social?: PestelCategoryPayload
+        technological?: PestelCategoryPayload
+        environmental?: PestelCategoryPayload
+        legal?: PestelCategoryPayload
+      }
+    }
+  }
+}
+
 export async function getMarketIntelligence(
   payload: MarketIntelligenceRequest,
 ): Promise<MarketIntelligenceAPIResponse> {
   return postJson<MarketIntelligenceAPIResponse>("/market-intelligence", payload)
+}
+
+export async function getMeceFramework(
+  payload: MeceFrameworkRequest,
+): Promise<MeceFrameworkAPIResponse> {
+  return postJson<MeceFrameworkAPIResponse>("/analyze/frameworks/mece", payload)
+}
+
+export async function getSwotFramework(
+  payload: SwotFrameworkRequest,
+): Promise<SwotFrameworkAPIResponse> {
+  return postJson<SwotFrameworkAPIResponse>("/analyze/frameworks/swot", payload)
+}
+
+export async function getPestelFramework(
+  payload: PestelFrameworkRequest,
+): Promise<PestelFrameworkAPIResponse> {
+  return postJson<PestelFrameworkAPIResponse>("/analyze/frameworks/pestel", payload)
+}
+
+function confidenceLevelFromPct(pct: number): "High" | "Medium" | "Low" {
+  if (pct >= 75) return "High"
+  if (pct >= 55) return "Medium"
+  return "Low"
+}
+
+function normalizePlatform(sourceType?: string, sourceReference?: string): string {
+  if (sourceReference && sourceReference.trim()) return sourceReference
+  if (!sourceType) return "Unknown"
+  return titleCase(sourceType)
+}
+
+export function mapSwotFrameworkToDashboardFields(
+  resp: SwotFrameworkAPIResponse,
+): { swotData: DashboardData["swotData"] } {
+  const result = resp.framework?.result_json ?? {}
+
+  const mapPoints = (points: SwotPoint[] = []) =>
+    points.map((p) => {
+      const confidencePct = Number(p.confidence_pct ?? 0)
+      const source = p.source_citation
+      return {
+        text: p.suggestion ?? p.derived_insight ?? p.label ?? "No insight provided",
+        confidence: confidenceLevelFromPct(confidencePct),
+        platform: normalizePlatform(source?.source_type, source?.source_reference),
+        sourceText: source?.quote ?? p.derived_insight ?? "No source quote available.",
+        sourceUrl: source?.source_url ?? "#",
+      }
+    })
+
+  return {
+    swotData: {
+      strengths: mapPoints(result.strengths),
+      weaknesses: mapPoints(result.weaknesses),
+      opportunities: mapPoints(result.opportunities),
+      threats: mapPoints(result.threats),
+      confidencePct: Number(resp.framework?.confidence_pct ?? 0),
+      totalReviews: Number(resp.summary_stats?.total_reviews ?? 0),
+    },
+  }
+}
+
+function normalizeImpact(value?: string): "Positive" | "Negative" | "Neutral" {
+  const clean = (value ?? "").toLowerCase()
+  if (clean === "positive") return "Positive"
+  if (clean === "negative") return "Negative"
+  return "Neutral"
+}
+
+function normalizeSeverity(value?: string): "High" | "Medium" | "Low" {
+  const clean = (value ?? "").toLowerCase()
+  if (clean === "high") return "High"
+  if (clean === "low") return "Low"
+  return "Medium"
+}
+
+export function mapPestelFrameworkToDashboardFields(
+  resp: PestelFrameworkAPIResponse,
+): { pestelData: DashboardData["pestelData"] } {
+  const categories = resp.framework?.result_json?.categories ?? {}
+  const base = EMPTY_DASHBOARD_DATA.pestelData
+
+  const mapFactors = (factors: PestelFactor[] = []) =>
+    factors.map((item) => ({
+      factor: item.title ?? "No factor title",
+      impact: normalizeImpact(item.sentiment),
+      severity: normalizeSeverity(item.severity),
+      description: item.summary ?? "No description available.",
+      implication: item.implication ?? "Continue monitoring this signal.",
+    }))
+
+  return {
+    pestelData: {
+      political: { ...base.political, items: mapFactors(categories.political?.factors) },
+      economic: { ...base.economic, items: mapFactors(categories.economic?.factors) },
+      social: { ...base.social, items: mapFactors(categories.social?.factors) },
+      technological: { ...base.technological, items: mapFactors(categories.technological?.factors) },
+      environmental: { ...base.environmental, items: mapFactors(categories.environmental?.factors) },
+      legal: { ...base.legal, items: mapFactors(categories.legal?.factors) },
+    },
+  }
+}
+
+export function mapMeceFrameworkToDashboardFields(
+  resp: MeceFrameworkAPIResponse,
+): { meceData: DashboardData["meceData"] } {
+  const result = resp.framework?.result_json
+  const categories = (result?.complaint_categories ?? []).map((item) => ({
+    category: item.category ?? "General Complaints",
+    description: item.description ?? "",
+    count: Number(item.count ?? 0),
+    examples: item.examples ?? [],
+    confidence: Number(item.confidence ?? 0),
+    sources: item.sources ?? [],
+  }))
+
+  return {
+    meceData: {
+      avg_score_pct: Number(result?.avg_score_pct ?? resp.framework?.avg_score_pct ?? 0),
+      product_focus: result?.product_focus ?? "pizzas",
+      is_exhaustive_note: result?.is_exhaustive_note ?? "",
+      complaint_categories: categories,
+    },
+  }
 }
 
 export function mapMarketIntelligenceToDashboardFields(
@@ -631,28 +892,12 @@ export function mapInsightsToDashboardData(payload: InsightsResponse): Dashboard
       },
     ],
     swotData: {
-      strengths: (payload.aspect_sentiment ?? [])
-        .filter((a) => a.overall_sentiment === "Positive")
-        .slice(0, 4)
-        .map((a) => ({
-          text: `${a.aspect} is a current strength`,
-          confidence: "High",
-          platform: "ABSA",
-          sourceText: `${a.aspect} trending positive`,
-          sourceUrl: "#",
-        })),
-      weaknesses: (payload.aspect_sentiment ?? [])
-        .filter((a) => a.overall_sentiment === "Negative")
-        .slice(0, 4)
-        .map((a) => ({
-          text: `${a.aspect} needs improvement`,
-          confidence: "High",
-          platform: "ABSA",
-          sourceText: `${a.aspect} trending negative`,
-          sourceUrl: "#",
-        })),
+      strengths: [],
+      weaknesses: [],
       opportunities: [],
       threats: [],
+      confidencePct: 0,
+      totalReviews: Number(payload.summary_stats?.total_reviews ?? 0),
     },
   }
 

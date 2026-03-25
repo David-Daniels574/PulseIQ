@@ -222,6 +222,7 @@ def compute_aspect_confidence(
 def compute_all_aspect_confidence(
     gmap_absa: Dict[str, Any],
     twitter_absa: Dict[str, Any],
+    extra_source_absas: Optional[Dict[str, Dict[str, Any]]] = None,
     months_back: int = 6,
 ) -> List[Dict[str, Any]]:
     """
@@ -231,6 +232,7 @@ def compute_all_aspect_confidence(
     Args:
         gmap_absa: output of analyze_multiple_reviews()  (Google Maps)
         twitter_absa: output of analyze_multiple_reviews()  (Twitter)
+        extra_source_absas: optional map like {"airtop": absa_dict}
         months_back: for recency weighting
 
     Returns:
@@ -252,8 +254,13 @@ def compute_all_aspect_confidence(
 
     gmap_by_aspect = extract_source_data(gmap_absa)
     twitter_by_aspect = extract_source_data(twitter_absa)
+    normalized_extra: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    for src_name, src_absa in (extra_source_absas or {}).items():
+        normalized_extra[src_name] = extract_source_data(src_absa or {})
 
     all_aspects = set(gmap_by_aspect.keys()) | set(twitter_by_aspect.keys())
+    for per_source in normalized_extra.values():
+        all_aspects |= set(per_source.keys())
 
     results: List[Dict[str, Any]] = []
     for aspect in sorted(all_aspects):
@@ -262,6 +269,9 @@ def compute_all_aspect_confidence(
             source_data["google_maps"] = gmap_by_aspect[aspect]
         if aspect in twitter_by_aspect:
             source_data["twitter"] = twitter_by_aspect[aspect]
+        for src_name, per_source in normalized_extra.items():
+            if aspect in per_source:
+                source_data[src_name] = per_source[aspect]
 
         conf = compute_aspect_confidence(aspect, source_data, months_back)
         results.append(conf)

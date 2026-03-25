@@ -38,7 +38,7 @@ def _build_query(
 def scrape_google_news(
     query_term: str,
     location: str = "Mumbai",
-    max_results: int = 10,
+    max_results: int = 5,
     exact_match: bool = True,
     include_location: bool = True,
 ) -> List[Dict[str, Any]]:
