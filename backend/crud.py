@@ -835,3 +835,57 @@ def mark_orm_review_responded(
         db.commit()
         db.refresh(row)
     return row
+
+
+def mark_review_responded_by_signature(
+    db: Session,
+    business_id: int,
+    source: str,
+    review_text: str,
+    author_name: str = None,
+    rating: float = None,
+    review_date: datetime = None,
+) -> models.ORMReview:
+    """
+    Mark a review as responded in ORM tracking using (business, source, review_text).
+    Creates a tracking row if one does not exist yet.
+    """
+    normalized_source = (source or "google_maps").strip().lower().replace(" ", "_")
+    allowed_sources = {s.value for s in models.SourceEnum}
+    if normalized_source not in allowed_sources:
+        normalized_source = "google_maps"
+
+    row = db.query(models.ORMReview).filter(
+        models.ORMReview.business_id == business_id,
+        models.ORMReview.source == normalized_source,
+        models.ORMReview.review_text == review_text,
+    ).first()
+
+    if not row:
+        sentiment = "Neutral"
+        if rating is not None:
+            if float(rating) >= 4:
+                sentiment = "Positive"
+            elif float(rating) <= 2:
+                sentiment = "Negative"
+
+        row = models.ORMReview(
+            business_id=business_id,
+            source=normalized_source,
+            review_text=review_text,
+            author_name=author_name,
+            rating=rating,
+            review_date=review_date,
+            aspect="General",
+            sentiment=sentiment,
+            confidence=100.0,
+            source_url=None,
+            is_responded=True,
+        )
+        db.add(row)
+    else:
+        row.is_responded = True
+
+    db.commit()
+    db.refresh(row)
+    return row

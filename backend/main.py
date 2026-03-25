@@ -126,6 +126,24 @@ class ResponseTemplateRequest(BaseModel):
     business_name: str = Field(..., description="Name of the business")
 
 
+class PublishReviewReplyRequest(BaseModel):
+    """Request model for publishing an owner reply to a review"""
+    review_id: Optional[int] = Field(None, description="Optional review id from frontend list")
+    source: str = Field(..., description="Review source, e.g. Google Maps, twitter")
+    response_text: str = Field(..., min_length=5, description="Owner reply text")
+    business_name: Optional[str] = Field(None, description="Business name for logging context")
+    place_id: Optional[str] = Field(None, description="Optional Google Maps place_id for redirecting to place reviews")
+    original_review_text: Optional[str] = Field(None, description="Original customer review text")
+
+
+class ORMReviewsRequest(BaseModel):
+    """Request model for fetching ORM review inbox from stored DB reviews"""
+    business_name: str = Field(..., description="Name of the business")
+    city: str = Field(..., description="City for fallback business lookup")
+    place_id: Optional[str] = Field(None, description="Optional place_id for direct business lookup")
+    limit: Optional[int] = Field(30, ge=1, le=200, description="Max reviews to return")
+
+
 class CompetitorAnalysisRequest(BaseModel):
     """Request model for competitor analysis"""
     business_name: str = Field(..., description="Name of your business")
@@ -1198,6 +1216,169 @@ async def create_response_template(request: ResponseTemplateRequest) -> Dict[str
     except Exception as e:
         logger.error(f"Error generating response template: {e}")
         raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+
+
+@app.post("/insights/publish-review-reply")
+async def publish_review_reply(
+    request: PublishReviewReplyRequest,
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """
+    Publish owner reply for a review source when supported.
+
+    For Google Maps in this project, we redirect users to the Google Maps place
+    page so they can post a response manually with any signed-in Google account.
+    """
+    try:
+        source_normalized = (request.source or "").strip().lower().replace("_", " ")
+        is_google_maps = source_normalized in {"google maps", "googlemaps", "google maps reviews"}
+
+        business_db = None
+        if request.place_id:
+            business_db = crud.get_business_by_place_id(db, request.place_id)
+        elif request.business_name:
+            # Fallback name-based lookup when place_id is unavailable.
+            business_db = crud.get_business_by_name(db, request.business_name, "")
+
+        if business_db and request.original_review_text:
+            crud.mark_review_responded_by_signature(
+                db=db,
+                business_id=business_db.id,
+                source=request.source,
+                review_text=request.original_review_text,
+            )
+
+        if is_google_maps:
+            if request.place_id:
+                redirect_url = f"https://search.google.com/local/writereview?placeid={request.place_id}"
+            elif request.business_name:
+                query = request.business_name.strip().replace(" ", "+")
+                redirect_url = f"https://www.google.com/maps/search/?api=1&query={query}"
+            else:
+                redirect_url = "https://www.google.com/maps"
+
+            return {
+                "status": "redirect_required",
+                "platform": "google_maps",
+                "requires_redirect": True,
+                "redirect_url": redirect_url,
+                "message": "Open Google Maps and post your reply manually from the review section.",
+            }
+
+        # Non-Google sources are not integrated for write actions in this project yet.
+        raise HTTPException(
+            status_code=501,
+            detail=f"Live reply publish is not configured for source: {request.source}",
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error publishing review reply: {e}")
+        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+
+
+@app.post("/insights/orm-reviews")
+async def get_orm_review_inbox(
+    request: ORMReviewsRequest,
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """
+    Fetch real reviews from DB for the ORM inbox UI.
+    Uses reviews table data (stored from Google Maps/Twitter ingestion) and
+    overlays responded state from ORM tracking rows.
+    """
+    try:
+        if request.place_id:
+            business_db = crud.get_business_by_place_id(db, request.place_id)
+        else:
+            business_db = crud.get_business_by_name(db, request.business_name, request.city)
+
+        if not business_db:
+            raise HTTPException(
+                status_code=404,
+                detail="Business not found in DB. Run /analyze/business/insights first.",
+            )
+
+        raw_reviews = crud.get_reviews_by_business(db, business_db.id)
+        raw_reviews = sorted(
+            raw_reviews,
+            key=lambda r: (r.review_date or r.created_at or datetime.min),
+            reverse=True,
+        )[: int(request.limit or 30)]
+
+        orm_rows = crud.get_orm_reviews(
+            db=db,
+            business_id=business_db.id,
+            only_unresponded=False,
+            limit=500,
+        )
+        responded_signatures = {
+            ((row.source.value if hasattr(row.source, "value") else str(row.source)), row.review_text)
+            for row in orm_rows if row.is_responded
+        }
+
+        def _sentiment_from_rating(rating: Optional[float]) -> str:
+            if rating is None:
+                return "Neutral"
+            if rating >= 4:
+                return "Positive"
+            if rating <= 2:
+                return "Negative"
+            return "Neutral"
+
+        def _source_label(source_value: str) -> str:
+            return source_value.replace("_", " ").title()
+
+        reviews_out: List[Dict[str, Any]] = []
+        for r in raw_reviews:
+            source_key = (r.source or "google_maps").strip().lower()
+            is_responded = (source_key, r.review_text) in responded_signatures
+            sentiment = _sentiment_from_rating(r.rating)
+            reviews_out.append(
+                {
+                    "id": r.id,
+                    "rating": float(r.rating or 0),
+                    "review_text": r.review_text,
+                    "aspect": "General",
+                    "sentiment": sentiment,
+                    "source": _source_label(source_key),
+                    "review_date": (r.review_date.isoformat() if r.review_date else (r.created_at.isoformat() if r.created_at else None)),
+                    "status": "Responded" if is_responded else "Pending",
+                }
+            )
+
+        total_count = len(reviews_out)
+        responded_count = sum(1 for r in reviews_out if r["status"] == "Responded")
+        pending_negative = sum(
+            1 for r in reviews_out
+            if r["status"] == "Pending" and r["sentiment"] == "Negative"
+        )
+        response_rate = int(round((responded_count / total_count) * 100)) if total_count else 0
+        sentiment_trend = "improving" if pending_negative == 0 else "watch"
+
+        return {
+            "status": "success",
+            "business_info": {
+                "name": business_db.name,
+                "place_id": business_db.place_id,
+                "city": business_db.location,
+            },
+            "summary_stats": {
+                "total_reviews": total_count,
+                "responded_reviews": responded_count,
+                "pending_negative": pending_negative,
+                "response_rate": response_rate,
+                "avg_response_time": "N/A",
+                "sentiment_trend": sentiment_trend,
+            },
+            "reviews": reviews_out,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"ORM review inbox endpoint error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ───────────────────────────────────────────────────────────────────

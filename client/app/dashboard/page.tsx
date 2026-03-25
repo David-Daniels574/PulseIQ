@@ -12,12 +12,14 @@ import {
   getSwotFramework,
   getPestelFramework,
   getMeceFramework,
+  getOrmReviews,
   getMarketIntelligence,
   mapCompetitorToDashboardData,
   mapInsightsToDashboardData,
   mapSwotFrameworkToDashboardFields,
   mapPestelFrameworkToDashboardFields,
   mapMeceFrameworkToDashboardFields,
+  mapOrmReviewsToDashboardFields,
   mapMarketIntelligenceToDashboardFields,
 } from "@/services/dashboard.service"
 
@@ -137,6 +139,19 @@ export default function DashboardPage() {
           setDashboardData((prev) => (prev ? { ...prev, ...meceFields } : prev))
         })
         .catch((err) => console.error("MECE fetch failed:", err))
+
+      // Fire ORM reviews call non-blocking — replaces synthetic rows with DB reviews
+      void getOrmReviews({
+        business_name: name,
+        city: cityVal,
+        place_id: placeId,
+        limit: 40,
+      })
+        .then((ormResp) => {
+          const ormFields = mapOrmReviewsToDashboardFields(ormResp)
+          setDashboardData((prev) => (prev ? { ...prev, ...ormFields } : prev))
+        })
+        .catch((err) => console.error("ORM reviews fetch failed:", err))
 
       // Fire market-intelligence call non-blocking — updates forecast + news when ready
       setIsMarketLoading(true)

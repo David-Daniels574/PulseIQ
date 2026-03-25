@@ -14,6 +14,64 @@ export type CompetitorRequest = {
   radius?: number
 }
 
+export type ResponseTemplateRequest = {
+  aspect: string
+  sentiment: string
+  business_name: string
+}
+
+export type ResponseTemplateAPIResponse = {
+  status: string
+  aspect: string
+  sentiment: string
+  business_name: string
+  response_template: string
+}
+
+export type PublishReviewReplyRequest = {
+  review_id?: number
+  source: string
+  response_text: string
+  business_name?: string
+  place_id?: string
+  original_review_text?: string
+}
+
+export type PublishReviewReplyAPIResponse = {
+  status: string
+  message?: string
+  redirect_url?: string
+  requires_redirect?: boolean
+  platform?: string
+}
+
+export type OrmReviewsRequest = {
+  business_name: string
+  city: string
+  place_id?: string
+  limit?: number
+}
+
+export type OrmReviewsAPIResponse = {
+  status: string
+  summary_stats?: {
+    response_rate?: number
+    avg_response_time?: string
+    pending_negative?: number
+    sentiment_trend?: string
+  }
+  reviews?: Array<{
+    id?: number
+    rating?: number
+    review_text?: string
+    aspect?: string
+    sentiment?: string
+    source?: string
+    review_date?: string | null
+    status?: string
+  }>
+}
+
 export type InsightsResponse = {
   status: string
   business_info?: {
@@ -79,6 +137,7 @@ export type CompetitorResponse = {
 export type DashboardData = {
   businessInfo: {
     name: string
+    place_id?: string
     address: string
     category: string
     rating: number
@@ -663,6 +722,60 @@ export async function getCompetitorInsights(payload: CompetitorRequest): Promise
   return postJson<CompetitorResponse>("/analyze/competitors", payload)
 }
 
+export async function generateResponseTemplate(
+  payload: ResponseTemplateRequest,
+): Promise<ResponseTemplateAPIResponse> {
+  return postJson<ResponseTemplateAPIResponse>("/insights/response-template", payload)
+}
+
+export async function publishReviewReply(
+  payload: PublishReviewReplyRequest,
+): Promise<PublishReviewReplyAPIResponse> {
+  return postJson<PublishReviewReplyAPIResponse>("/insights/publish-review-reply", payload)
+}
+
+export async function getOrmReviews(
+  payload: OrmReviewsRequest,
+): Promise<OrmReviewsAPIResponse> {
+  return postJson<OrmReviewsAPIResponse>("/insights/orm-reviews", payload)
+}
+
+export function mapOrmReviewsToDashboardFields(
+  resp: OrmReviewsAPIResponse,
+): { ormData: DashboardData["ormData"] } {
+  const reviews = (resp.reviews ?? []).map((r) => {
+    const rawSentiment = String(r.sentiment ?? "Neutral").toLowerCase()
+    const sentiment = rawSentiment === "positive"
+      ? "Positive"
+      : rawSentiment === "negative"
+        ? "Negative"
+        : "Neutral"
+
+    return {
+      id: Number(r.id ?? 0),
+      rating: Number(r.rating ?? 0),
+      text: r.review_text ?? "",
+      aspect: r.aspect ?? "General",
+      sentiment,
+      source: r.source ?? "Google Maps",
+      date: r.review_date ? String(r.review_date).slice(0, 10) : new Date().toISOString().slice(0, 10),
+      status: r.status ?? "Pending",
+    }
+  })
+
+  return {
+    ormData: {
+      reviews,
+      analytics: {
+        responseRate: Number(resp.summary_stats?.response_rate ?? 0),
+        avgResponseTime: resp.summary_stats?.avg_response_time ?? "N/A",
+        pendingNegative: Number(resp.summary_stats?.pending_negative ?? 0),
+        sentimentTrend: resp.summary_stats?.sentiment_trend ?? "stable",
+      },
+    },
+  }
+}
+
 export function mapCompetitorToDashboardData(payload: CompetitorResponse): DashboardData["competitorData"] {
   const yourRating = Number(payload.market_position?.your_rating ?? payload.main_business?.rating ?? 0)
   const avgCompetitorRating = Number(payload.market_position?.avg_competitor_rating ?? 0)
@@ -761,6 +874,7 @@ export function mapInsightsToDashboardData(payload: InsightsResponse): Dashboard
     ...EMPTY_DASHBOARD_DATA,
     businessInfo: {
       name: payload.business_info?.name ?? "",
+      place_id: payload.business_info?.place_id,
       address: payload.business_info?.address ?? "",
       category: "Restaurant",
       rating: Number((payload.summary_stats?.avg_rating ?? 0).toFixed(2)),
@@ -835,21 +949,12 @@ export function mapInsightsToDashboardData(payload: InsightsResponse): Dashboard
     },
     bcgMatrixData,
     ormData: {
-      reviews: (payload.aspect_sentiment ?? []).slice(0, 6).map((a, i) => ({
-        id: i + 1,
-        rating: a.overall_sentiment === "Positive" ? 5 : a.overall_sentiment === "Negative" ? 2 : 3,
-        text: `${a.aspect} sentiment is ${a.overall_sentiment.toLowerCase()} (${Math.round(a.confidence_score * 100)}% confidence).`,
-        aspect: a.aspect,
-        sentiment: a.overall_sentiment,
-        source: "Google Maps",
-        date: new Date().toISOString().slice(0, 10),
-        status: i % 2 === 0 ? "Pending" : "Responded",
-      })),
+      reviews: [],
       analytics: {
-        responseRate: 80,
-        avgResponseTime: "24 hours",
-        pendingNegative: (payload.aspect_sentiment ?? []).filter((a) => a.overall_sentiment === "Negative").length,
-        sentimentTrend: positive >= negative ? "improving" : "declining",
+        responseRate: 0,
+        avgResponseTime: "N/A",
+        pendingNegative: 0,
+        sentimentTrend: "stable",
       },
     },
     socialListeningData: {

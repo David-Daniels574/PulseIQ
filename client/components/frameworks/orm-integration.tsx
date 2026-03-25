@@ -1,6 +1,6 @@
 "use client"
 
-import { useState } from "react"
+import { useEffect, useMemo, useState } from "react"
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -23,33 +23,91 @@ import {
 import { Textarea } from "@/components/ui/textarea"
 import { Star, MessageSquare, Clock, TrendingUp, AlertCircle, Send, Sparkles } from "lucide-react"
 import { useDashboardData } from "@/hooks/use-dashboard-data"
+import { generateResponseTemplate, publishReviewReply } from "@/services/dashboard.service"
 import { format } from "date-fns"
 
 export function ORMIntegration() {
-  const { ormData } = useDashboardData()
+  const { ormData, businessInfo } = useDashboardData()
   const [selectedReview, setSelectedReview] = useState<typeof ormData.reviews[0] | null>(null)
   const [responseText, setResponseText] = useState("")
   const [sentimentFilter, setSentimentFilter] = useState("all")
   const [statusFilter, setStatusFilter] = useState("all")
+  const [reviews, setReviews] = useState(ormData.reviews)
+  const [isGeneratingTemplate, setIsGeneratingTemplate] = useState(false)
+  const [isPublishing, setIsPublishing] = useState(false)
+  const [dialogError, setDialogError] = useState<string | null>(null)
 
-  const filteredReviews = ormData.reviews.filter(review => {
+  useEffect(() => {
+    setReviews(ormData.reviews)
+  }, [ormData.reviews])
+
+  const filteredReviews = useMemo(() => reviews.filter(review => {
     const matchesSentiment = sentimentFilter === "all" || review.sentiment === sentimentFilter
     const matchesStatus = statusFilter === "all" || review.status === statusFilter
     return matchesSentiment && matchesStatus
-  })
+  }), [reviews, sentimentFilter, statusFilter])
 
-  const handleRespond = (review: typeof ormData.reviews[0]) => {
+  const handleRespond = async (review: typeof ormData.reviews[0]) => {
     setSelectedReview(review)
-    // Generate AI response template
-    const template = review.sentiment === "Negative"
-      ? `Thank you for taking the time to share your feedback about ${review.aspect.toLowerCase()}. We sincerely apologize for not meeting your expectations. We take your comments seriously and are actively working to improve. We would love the opportunity to make things right - please feel free to reach out directly so we can address your concerns personally.`
-      : `Thank you so much for your wonderful feedback! We're thrilled to hear that you enjoyed your experience with us, especially regarding ${review.aspect.toLowerCase()}. Your kind words mean a lot to our team. We look forward to welcoming you back soon!`
-    setResponseText(template)
+    setDialogError(null)
+    setIsGeneratingTemplate(true)
+
+    try {
+      const resp = await generateResponseTemplate({
+        aspect: review.aspect,
+        sentiment: review.sentiment,
+        business_name: businessInfo.name || "the business",
+      })
+      setResponseText(resp.response_template)
+    } catch (error) {
+      const fallbackTemplate = review.sentiment === "Negative"
+        ? `Thank you for taking the time to share your feedback about ${review.aspect.toLowerCase()}. We sincerely apologize for not meeting your expectations. We take your comments seriously and are actively working to improve. We would love the opportunity to make things right - please feel free to reach out directly so we can address your concerns personally.`
+        : `Thank you so much for your wonderful feedback! We're thrilled to hear that you enjoyed your experience with us, especially regarding ${review.aspect.toLowerCase()}. Your kind words mean a lot to our team. We look forward to welcoming you back soon!`
+      setResponseText(fallbackTemplate)
+      setDialogError(error instanceof Error ? error.message : "Failed to generate AI response template.")
+    } finally {
+      setIsGeneratingTemplate(false)
+    }
   }
 
   const closeDialog = () => {
     setSelectedReview(null)
     setResponseText("")
+    setDialogError(null)
+  }
+
+  const handlePublish = async () => {
+    if (!selectedReview || !responseText.trim()) return
+
+    setIsPublishing(true)
+    setDialogError(null)
+    try {
+      const publishResp = await publishReviewReply({
+        review_id: selectedReview.id,
+        source: selectedReview.source,
+        response_text: responseText,
+        business_name: businessInfo.name,
+        place_id: businessInfo.place_id,
+        original_review_text: selectedReview.text,
+      })
+
+      if (publishResp.requires_redirect && publishResp.redirect_url) {
+        const opened = window.open(publishResp.redirect_url, "_blank", "noopener,noreferrer")
+        if (!opened) {
+          setDialogError("Popup blocked. Please allow popups and try again.")
+          return
+        }
+      }
+
+      setReviews((prev) => prev.map((r) => (
+        r.id === selectedReview.id ? { ...r, status: "Responded" } : r
+      )))
+      closeDialog()
+    } catch (error) {
+      setDialogError(error instanceof Error ? error.message : "Failed to publish response.")
+    } finally {
+      setIsPublishing(false)
+    }
   }
 
   const getSentimentColor = (sentiment: string) => {
@@ -252,18 +310,29 @@ export function ORMIntegration() {
                   onChange={(e) => setResponseText(e.target.value)}
                   rows={6}
                   className="resize-none"
+                  disabled={isGeneratingTemplate || isPublishing}
                 />
               </div>
+
+              {dialogError && (
+                <div className="rounded-md border border-destructive/40 bg-destructive/10 p-3 text-sm text-destructive">
+                  {dialogError}
+                </div>
+              )}
             </div>
           )}
           
           <DialogFooter>
-            <Button variant="outline" onClick={closeDialog}>
+            <Button variant="outline" onClick={closeDialog} disabled={isPublishing}>
               Cancel
             </Button>
-            <Button className="gap-2" onClick={closeDialog}>
+            <Button
+              className="gap-2"
+              onClick={handlePublish}
+              disabled={isGeneratingTemplate || isPublishing || !responseText.trim()}
+            >
               <Send className="h-4 w-4" />
-              Publish Response
+              {isPublishing ? "Publishing..." : "Publish Response"}
             </Button>
           </DialogFooter>
         </DialogContent>
