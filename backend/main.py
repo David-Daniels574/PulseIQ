@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field
 from typing import Optional, Dict, Any, List
 import uvicorn
 import logging
+import math
 from services.twitter_scraper import get_restaurant_reviews
 import os
 from dotenv import load_dotenv
@@ -231,8 +232,7 @@ async def root():
             "/analyze/business": "POST - Fetch and analyze business reviews from Google Maps",
             "/analyze/business/insights": "POST - Fetch reviews, analyze, AND generate strategic insights (STORED IN DB)",
             "/analyze/competitors": "POST - Find and analyze top 4 competitors in your area",
-            "/market-intelligence": "POST - Scrape Google News for business mentions and media tracking",
-            "/market-intelligence/{business_name}": "GET - Retrieve stored market intelligence data",
+            "/market-intelligence": "POST - Star-rating forecast + industry trend and market news",
             "/insights/generate": "POST - Generate insights from existing ABSA results",
             "/insights/response-template": "POST - Generate review response templates",
             "/history": "GET - View analysis history",
@@ -246,7 +246,7 @@ async def root():
             "Multi-Category Support (Restaurant, Hotel, Gym, Salon, etc.)",
             "Google Maps Reviews Integration",
             "Competitor Analysis & Benchmarking",
-            "Market Intelligence - Google News Scraping",
+            "Market Intelligence - Industry Trends & News",
             "Media Monitoring & Brand Tracking",
             "AI-Powered Strategic Recommendations using Gemini",
             "RAG-Enhanced Context-Aware Insights",
@@ -651,6 +651,7 @@ async def analyze_competitors(
     try:
         # ── Resolve main business ──────────────────────────────────
         main_db = crud.get_business_by_name(db, request.business_name, request.city)
+        main_price_level = None
  
         if not main_db:
             query = f"{request.business_name} {request.area} {request.city}"
@@ -660,8 +661,9 @@ async def analyze_competitors(
             place = places["results"][0]
             det   = gmaps.place(
                 place_id=place["place_id"],
-                fields=["name", "rating", "user_ratings_total", "formatted_address"],
+                fields=["name", "rating", "user_ratings_total", "formatted_address", "price_level"],
             )["result"]
+            main_price_level = det.get("price_level")
             main_db = crud.get_or_create_business(
                 db=db,
                 place_id=place["place_id"],
@@ -674,6 +676,15 @@ async def analyze_competitors(
                 rating=det.get("rating"),
                 total_reviews=det.get("user_ratings_total", 0),
             )
+        else:
+            try:
+                main_details = gmaps.place(
+                    place_id=main_db.place_id,
+                    fields=["price_level"],
+                ).get("result", {})
+                main_price_level = main_details.get("price_level")
+            except Exception:
+                main_price_level = None
  
         if not main_db.latitude or not main_db.longitude:
             raise HTTPException(status_code=400, detail="Main business has no coordinates. Run /analyze/business/insights first.")
@@ -687,10 +698,24 @@ async def analyze_competitors(
             radius=request.radius,
             keyword=request.category,
         )
-        raw_competitors = [
+        nearby_candidates = [
             p for p in nearby.get("results", [])
             if p["place_id"] != main_db.place_id and p.get("rating")
         ]
+
+        # Prefer competitors in a comparable price band (if available from Google)
+        price_matched = []
+        price_unmatched = []
+        for p in nearby_candidates:
+            p_level = p.get("price_level")
+            if main_price_level is None or p_level is None:
+                price_matched.append(p)
+            elif abs(int(p_level) - int(main_price_level)) <= 1:
+                price_matched.append(p)
+            else:
+                price_unmatched.append(p)
+
+        raw_competitors = price_matched if len(price_matched) >= 3 else (price_matched + price_unmatched)
         raw_competitors.sort(
             key=lambda p: (p.get("rating", 0), p.get("user_ratings_total", 0)),
             reverse=True,
@@ -700,7 +725,7 @@ async def analyze_competitors(
         # ── Fetch/store competitor details + ABSA ─────────────────
         set_aspect_keywords_for_category(request.category)
  
-        target_aspects = ["Food/Product", "Service", "Ambiance", "Price"]
+        target_aspects = ["Food", "Service", "Ambiance", "Price", "Location"]
         # "Location" is inferred from rating since Google Maps reviews often mention it
  
         def compute_aspect_scores_1_5(absa: Dict[str, Any]) -> Dict[str, float]:
@@ -718,6 +743,12 @@ async def analyze_competitors(
  
         competitors_out = []
         competitor_aspect_scores: Dict[str, Dict[str, float]] = {}
+
+        def _composite_market_score(rating: float, reviews: int, max_log_reviews: float) -> float:
+            # Score in [0, 1]: rating quality dominates, review volume adds trust signal.
+            rating_norm = max(0.0, min(1.0, rating / 5.0))
+            volume_norm = 0.0 if max_log_reviews <= 0 else min(1.0, math.log1p(max(0, reviews)) / max_log_reviews)
+            return 0.7 * rating_norm + 0.3 * volume_norm
  
         for rank, place in enumerate(top5, start=1):
             comp_db = crud.get_or_create_business(
@@ -744,14 +775,6 @@ async def analyze_competitors(
  
             comp_rating  = float(comp_db.rating or 0)
             comp_reviews = int(comp_db.total_reviews or 0)
- 
-            # Rating position label
-            if comp_rating > your_rating:
-                position = "Leader"
-            elif comp_rating >= your_rating * 0.95:
-                position = "Challenger"
-            else:
-                position = "Follower"
  
             # Light ABSA on competitor reviews
             try:
@@ -794,9 +817,14 @@ async def analyze_competitors(
                 "name":         comp_db.name,
                 "rating":       comp_rating,
                 "reviews":      comp_reviews,
+                "price_level":  place.get("price_level"),
+                "price_match":  (
+                    True if main_price_level is None or place.get("price_level") is None
+                    else abs(int(place.get("price_level")) - int(main_price_level)) <= 1
+                ),
                 "status":       status,
                 "category":     request.category,
-                "position":     position,
+                "position":     "Unknown",
                 "address":      comp_db.address,
                 "aspect_scores": comp_scores,
             })
@@ -810,7 +838,9 @@ async def analyze_competitors(
         if main_analysis and main_analysis.aspect_results:
             # aspect_results may be nested by source, e.g. {google_maps: {...}, twitter: {...}}
             ar = main_analysis.aspect_results
-            if "google_maps" in ar:
+            if "combined" in ar and isinstance(ar["combined"], dict):
+                your_scores = compute_aspect_scores_1_5(ar["combined"])
+            elif "google_maps" in ar:
                 combined_absa: Dict[str, Any] = {}
                 for src_data in ar.values():
                     if isinstance(src_data, dict):
@@ -824,7 +854,8 @@ async def analyze_competitors(
             your_scores = {}
  
         # ── Aspect showdown ────────────────────────────────────────
-        all_aspects = set(your_scores.keys())
+        all_aspects = set(target_aspects)
+        all_aspects.update(your_scores.keys())
         for scores in competitor_aspect_scores.values():
             all_aspects.update(scores.keys())
  
@@ -851,16 +882,35 @@ async def analyze_competitors(
         else:
             avg_comp_rating  = 0.0
             avg_comp_reviews = 0
- 
-        if avg_comp_rating:
-            if your_rating > avg_comp_rating:
-                market_position = "Leader"
-            elif your_rating >= avg_comp_rating * 0.95:
-                market_position = "Challenger"
-            else:
-                market_position = "Follower"
+
+        # Composite market position: quality (rating) + scale (review count)
+        all_review_counts = [your_reviews] + [int(c["reviews"]) for c in competitors_out]
+        max_log_reviews = max([math.log1p(max(0, r)) for r in all_review_counts], default=1.0)
+
+        your_market_score = _composite_market_score(your_rating, your_reviews, max_log_reviews)
+        comp_scores = [
+            _composite_market_score(float(c["rating"]), int(c["reviews"]), max_log_reviews)
+            for c in competitors_out
+        ]
+        avg_comp_market_score = round(sum(comp_scores) / len(comp_scores), 4) if comp_scores else 0.0
+        best_comp_market_score = max(comp_scores) if comp_scores else 0.0
+
+        if your_market_score >= (best_comp_market_score - 0.02):
+            market_position = "Leader"
+        elif your_market_score >= (avg_comp_market_score - 0.01):
+            market_position = "Challenger"
         else:
-            market_position = "Unknown"
+            market_position = "Follower"
+
+        # Assign per-competitor relative position consistently using the same scoring model
+        for c in competitors_out:
+            c_score = _composite_market_score(float(c["rating"]), int(c["reviews"]), max_log_reviews)
+            if c_score >= (your_market_score + 0.02):
+                c["position"] = "Leader"
+            elif c_score >= (your_market_score - 0.01):
+                c["position"] = "Challenger"
+            else:
+                c["position"] = "Follower"
  
         # rating_vs_reviews_chart — scatter data
         rating_vs_reviews_chart = [
@@ -892,6 +942,9 @@ async def analyze_competitors(
                 "avg_competitor_rating": avg_comp_rating,
                 "avg_competitor_reviews": avg_comp_reviews,
                 "rating_vs_avg":        round(your_rating - avg_comp_rating, 2),
+                "your_market_score":    round(your_market_score, 4),
+                "avg_competitor_market_score": round(avg_comp_market_score, 4),
+                "main_price_level":     main_price_level,
             },
             "competitors":              competitors_out,
             "rating_vs_reviews_chart":  rating_vs_reviews_chart,
@@ -907,9 +960,8 @@ async def analyze_competitors(
         raise HTTPException(status_code=500, detail=str(e))
 
 # ───────────────────────────────────────────────────────────────────
-# 5.  NEW ENDPOINT  /market-intelligence  (POST — Market Intelligence page)
-#     Replaces the old POST /market-intelligence (which tracked competitors).
-#     Old GET /market-intelligence/{business_name} is UNCHANGED.
+# 5.  ENDPOINT  /market-intelligence  (POST — Market Intelligence page)
+#     Single endpoint for forecast + industry trend/news intelligence.
 # ───────────────────────────────────────────────────────────────────
  
 @app.post("/market-intelligence")
@@ -918,20 +970,22 @@ async def get_market_intelligence(
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
     """
-    Market Intelligence page — XGBoost rating forecast + Google News.
+    Market Intelligence page — XGBoost rating forecast + industry trend/news.
  
     Returns:
     - forecast: current_rating, predicted_rating, expected_change, trend, confidence
     - forecast_data: monthly [{month, forecast, actual}]
-    - news: total_articles, media_visibility, top_sources, articles (with links)
+    - market_intelligence_news: industry-level trends, top sources, articles (with links)
     """
     start_time = datetime.now()
+
+    biz = crud.get_business_by_name(db, request.business_name, request.city)
+    effective_category = (request.category or (biz.category if biz else None) or "restaurant").strip()
  
     # ── Derive sentiment_score from stored ABSA if not provided ───
     sentiment_score = request.sentiment_score
     if sentiment_score is None:
         try:
-            biz = crud.get_business_by_name(db, request.business_name, request.city)
             if biz:
                 analysis = (
                     crud.get_latest_analysis(db, biz.id, "absa_full") or
@@ -976,34 +1030,60 @@ async def get_market_intelligence(
         predictions      = []
         forecast_summary = {}
  
-    # ── Google News ───────────────────────────────────────────────
-    news_location = request.location or request.city
+    # ── Industry News / Trend signals ─────────────────────────────
+    news_location = request.location or "India"
+    category_lc = effective_category.lower()
+    category_news_term = f"{effective_category} news"
+    category_trend_term = f"{effective_category} food trends"
+    if "bar" in category_lc:
+        category_trend_term = f"{effective_category} beverage trends"
+    elif "cafe" in category_lc or "coffee" in category_lc:
+        category_trend_term = f"{effective_category} coffee trends"
+
+    industry_queries = [
+        category_news_term,
+        category_trend_term,
+        f"{effective_category} consumer trends India",
+        f"{effective_category} market outlook India",
+        "restaurant industry news India",
+        "commercial LPG price hike restaurants India",
+        "LPG crisis restaurant industry India",
+        "food inflation restaurant industry India",
+        "food service supply chain disruption India",
+    ]
+
+    query_results: Dict[str, List[Dict[str, Any]]] = {}
     try:
-        articles = scrape_google_news(
-            query_term=request.business_name,
+        query_results = scrape_multiple_queries(
+            query_terms=industry_queries,
             location=news_location,
-            max_results=25,
+            max_results_per_query=8,
+            exact_match=False,
+            include_location=False,
         )
     except Exception as e:
-        logger.error(f"News scrape error: {e}")
-        articles = []
- 
-    # Store news
-    biz = crud.get_business_by_name(db, request.business_name, request.city)
-    if biz:
-        for article in articles:
-            try:
-                crud.create_web_scraping_result(
-                    db=db,
-                    business_id=biz.id,
-                    query_term=request.business_name,
-                    headline=article["headline"],
-                    link=article["link"],
-                    source_name=article["source_name"],
-                )
-            except Exception:
-                pass
- 
+        logger.error(f"Industry news scrape error: {e}")
+        query_results = {}
+
+    # Flatten and de-duplicate by link
+    seen_links = set()
+    articles: List[Dict[str, Any]] = []
+    for query_term, query_articles in query_results.items():
+        for a in query_articles:
+            link = a.get("link")
+            if not link or link in seen_links:
+                continue
+            seen_links.add(link)
+            articles.append({
+                "headline": a.get("headline", ""),
+                "link": link,
+                "source_name": a.get("source_name", "Unknown"),
+                "query": query_term,
+            })
+
+    # Keep response size manageable while preserving source diversity
+    articles = articles[:40]
+
     # Top sources (by frequency)
     source_counts: Dict[str, int] = {}
     for a in articles:
@@ -1019,6 +1099,25 @@ async def get_market_intelligence(
         else "Medium" if len(articles) >= 4
         else "Low"
     )
+
+    # Simple keyword trend extraction from headlines
+    stop_words = {
+        "the", "and", "for", "with", "from", "this", "that", "into", "over", "after",
+        "will", "are", "has", "have", "its", "their", "about", "your", "new", "latest",
+        "restaurant", "industry", "market", "trends",
+    }
+    keyword_counts: Dict[str, int] = {}
+    for a in articles:
+        for token in (a.get("headline", "").lower().replace("-", " ").split()):
+            token = "".join(ch for ch in token if ch.isalnum())
+            if len(token) < 4 or token in stop_words:
+                continue
+            keyword_counts[token] = keyword_counts.get(token, 0) + 1
+
+    trend_topics = [
+        {"topic": k, "count": v}
+        for k, v in sorted(keyword_counts.items(), key=lambda x: x[1], reverse=True)[:8]
+    ]
  
     execution_time = int((datetime.now() - start_time).total_seconds() * 1000)
  
@@ -1034,87 +1133,26 @@ async def get_market_intelligence(
             "sentiment_score_used": sentiment_score,
         },
         "forecast_data":    predictions,
-        "news": {
+        "market_intelligence_news": {
+            "scope": "industry",
+            "location": news_location,
+            "queries_used": industry_queries,
             "total_articles":    len(articles),
             "media_visibility":  media_visibility,
             "top_sources":       top_sources,
+            "trend_topics":      trend_topics,
             "articles": [
                 {
                     "headline":    a["headline"],
                     "link":        a["link"],
                     "source_name": a.get("source_name", "Unknown"),
+                    "query":       a.get("query"),
                 }
                 for a in articles
             ],
         },
         "execution_time_ms": execution_time,
     }
- 
-
-# Get stored market intelligence
-@app.get("/market-intelligence/{business_name}")
-async def get_stored_market_intelligence(
-    business_name: str,
-    limit: int = 50,
-    db: Session = Depends(get_db)
-) -> Dict[str, Any]:
-    """
-    Retrieve stored market intelligence for a business
-    
-    Args:
-        business_name: Name of the business
-        limit: Maximum number of articles to return
-        db: Database session (injected)
-        
-    Returns:
-        Stored news articles and mentions
-    """
-    try:
-        # Get scraping results by query term
-        results = crud.get_scraping_results_by_query(db, business_name, limit=limit)
-        
-        if not results:
-            return {
-                "status": "success",
-                "business_name": business_name,
-                "total_articles": 0,
-                "articles": [],
-                "message": "No market intelligence data found. Run POST /market-intelligence first."
-            }
-        
-        # Group by source
-        by_source = {}
-        for result in results:
-            source = result.source_name or "Unknown"
-            if source not in by_source:
-                by_source[source] = []
-            by_source[source].append({
-                "headline": result.headline,
-                "link": result.link,
-                "scraped_at": result.scraped_at.isoformat() if result.scraped_at else None
-            })
-        
-        return {
-            "status": "success",
-            "business_name": business_name,
-            "total_articles": len(results),
-            "articles": [
-                {
-                    "id": result.id,
-                    "headline": result.headline,
-                    "link": result.link,
-                    "source_name": result.source_name,
-                    "scraped_at": result.scraped_at.isoformat() if result.scraped_at else None
-                }
-                for result in results
-            ],
-            "by_source": by_source,
-            "most_recent": results[0].scraped_at.isoformat() if results else None
-        }
-        
-    except Exception as e:
-        logger.error(f"Error retrieving market intelligence: {e}")
-        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
 
 
 # Run the application

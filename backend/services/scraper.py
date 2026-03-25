@@ -23,7 +23,25 @@ HEADERS = {
 }
 
 
-def scrape_google_news(query_term: str, location: str = "Mumbai", max_results: int = 10) -> List[Dict[str, Any]]:
+def _build_query(
+    query_term: str,
+    location: str,
+    exact_match: bool,
+    include_location: bool,
+) -> str:
+    core = f'"{query_term}"' if exact_match else query_term
+    if include_location and location:
+        return f"{core} {location}".strip()
+    return core.strip()
+
+
+def scrape_google_news(
+    query_term: str,
+    location: str = "Mumbai",
+    max_results: int = 10,
+    exact_match: bool = True,
+    include_location: bool = True,
+) -> List[Dict[str, Any]]:
     """
     Scrapes Google News for a specific query term and returns a list of articles.
     
@@ -48,7 +66,13 @@ def scrape_google_news(query_term: str, location: str = "Mumbai", max_results: i
     
     # Try RSS feed approach first (more reliable)
     try:
-        articles = scrape_google_news_rss(query_term, location, max_results)
+        articles = scrape_google_news_rss(
+            query_term=query_term,
+            location=location,
+            max_results=max_results,
+            exact_match=exact_match,
+            include_location=include_location,
+        )
         if articles:
             logger.info(f"Successfully scraped {len(articles)} articles using RSS feed")
             return articles
@@ -56,17 +80,29 @@ def scrape_google_news(query_term: str, location: str = "Mumbai", max_results: i
         logger.warning(f"RSS approach failed: {e}, falling back to HTML scraping")
     
     # Fallback to HTML scraping
-    return scrape_google_news_html(query_term, location, max_results)
+    return scrape_google_news_html(
+        query_term=query_term,
+        location=location,
+        max_results=max_results,
+        exact_match=exact_match,
+        include_location=include_location,
+    )
 
 
-def scrape_google_news_rss(query_term: str, location: str, max_results: int) -> List[Dict[str, Any]]:
+def scrape_google_news_rss(
+    query_term: str,
+    location: str,
+    max_results: int,
+    exact_match: bool = True,
+    include_location: bool = True,
+) -> List[Dict[str, Any]]:
     """
     Scrape Google News using RSS feed (more reliable)
     """
     from xml.etree import ElementTree
     
     # Format query for RSS
-    query = f'"{query_term}" {location}'
+    query = _build_query(query_term, location, exact_match, include_location)
     encoded_query = urllib.parse.quote_plus(query)
     
     # Google News RSS feed URL
@@ -112,13 +148,19 @@ def scrape_google_news_rss(query_term: str, location: str, max_results: int) -> 
     return articles
 
 
-def scrape_google_news_html(query_term: str, location: str, max_results: int) -> List[Dict[str, Any]]:
+def scrape_google_news_html(
+    query_term: str,
+    location: str,
+    max_results: int,
+    exact_match: bool = True,
+    include_location: bool = True,
+) -> List[Dict[str, Any]]:
     """
     Fallback HTML scraping method
     """
     
-    # Format the query - add quotes for exact match and location
-    query = f'"{query_term}" {location}'
+    # Format the query
+    query = _build_query(query_term, location, exact_match, include_location)
     
     # URL encode the query
     encoded_query = urllib.parse.quote_plus(query)
@@ -277,7 +319,13 @@ def scrape_google_news_html(query_term: str, location: str, max_results: int) ->
         return []
 
 
-def scrape_multiple_queries(query_terms: List[str], location: str = "Mumbai") -> Dict[str, List[Dict[str, Any]]]:
+def scrape_multiple_queries(
+    query_terms: List[str],
+    location: str = "Mumbai",
+    max_results_per_query: int = 10,
+    exact_match: bool = True,
+    include_location: bool = True,
+) -> Dict[str, List[Dict[str, Any]]]:
     """
     Scrape Google News for multiple query terms (e.g., main business + competitors)
     
@@ -291,7 +339,13 @@ def scrape_multiple_queries(query_terms: List[str], location: str = "Mumbai") ->
     results = {}
     
     for query_term in query_terms:
-        articles = scrape_google_news(query_term, location)
+        articles = scrape_google_news(
+            query_term=query_term,
+            location=location,
+            max_results=max_results_per_query,
+            exact_match=exact_match,
+            include_location=include_location,
+        )
         results[query_term] = articles
         
         # Be polite: Add delay between different queries
