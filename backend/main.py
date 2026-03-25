@@ -1080,6 +1080,7 @@ async def analyze_competitors(
  
     Returns:
     - main_business: name, rating, total_reviews
+    - vrio: Valuable/Rare/Inimitable/Organized per aspect with advantage type
     - market_position: Leader / Challenger / Follower
     - avg_competitor_rating, avg_competitor_reviews, rating_vs_avg
     - competitors: list of top-5 with name/rating/reviews/status/category/position
@@ -1313,6 +1314,68 @@ async def analyze_competitors(
                 "competitor_avg":   round(sum(comp_vals) / len(comp_vals), 2) if comp_vals else None,
                 "scale":            "1-5",
             })
+
+        # ── VRIO analysis (aspect-level) ─────────────────────────
+        agg_rows = crud.get_aggregated_absa(db, main_db.id)
+        variance_by_aspect = {
+            r.aspect: float(r.sentiment_variance or 0.0)
+            for r in agg_rows
+            if getattr(r, "aspect", None)
+        }
+
+        def _is_inimitable(aspect: str, gap: float, your_score_val: float) -> bool:
+            al = aspect.lower()
+            # Heuristic: location/ambiance are usually harder to copy;
+            # strong food signature can also be hard to imitate.
+            if "location" in al or "ambiance" in al:
+                return gap >= 0.2 and your_score_val >= 3.6
+            if "food" in al:
+                return gap >= 0.4 and your_score_val >= 3.9
+            return gap >= 0.5 and your_score_val >= 4.0
+
+        def _advantage_type(v: bool, r: bool, i: bool, o: bool) -> str:
+            if not v:
+                return "Competitive Disadvantage"
+            if v and not r:
+                return "Competitive Parity"
+            if v and r and not i:
+                return "Temporary Competitive Advantage"
+            if v and r and i and not o:
+                return "Unused Competitive Advantage"
+            return "Sustained Competitive Advantage"
+
+        vrio_entries: List[Dict[str, Any]] = []
+        for row in aspect_showdown:
+            aspect = row.get("aspect")
+            your_score_val = float(row.get("your_score") or 0.0)
+            comp_avg_val = float(row.get("competitor_avg") or 0.0)
+            gap = round(your_score_val - comp_avg_val, 2)
+
+            valuable = your_score_val >= 3.6
+            rare = (row.get("competitor_avg") is not None) and gap >= 0.25
+            inimitable = _is_inimitable(aspect, gap, your_score_val)
+            variance = variance_by_aspect.get(aspect)
+            organized = True if variance is None else variance <= 0.05
+
+            vrio_entries.append(
+                {
+                    "aspect": aspect,
+                    "your_score": round(your_score_val, 2),
+                    "competitor_avg": row.get("competitor_avg"),
+                    "gap_vs_competitors": gap,
+                    "valuable": valuable,
+                    "rare": bool(rare),
+                    "inimitable": inimitable,
+                    "organized": organized,
+                    "consistency_variance": round(variance, 4) if variance is not None else None,
+                    "advantage_type": _advantage_type(valuable, bool(rare), inimitable, organized),
+                }
+            )
+
+        vrio_summary_counts: Dict[str, int] = {}
+        for e in vrio_entries:
+            t = e["advantage_type"]
+            vrio_summary_counts[t] = vrio_summary_counts.get(t, 0) + 1
  
         # ── Market position metrics ────────────────────────────────
         if competitors_out:
@@ -1378,6 +1441,10 @@ async def analyze_competitors(
                 "rating":        your_rating,
                 "total_reviews": your_reviews,
                 "address":       main_db.address,
+            },
+            "vrio": {
+                "summary": vrio_summary_counts,
+                "aspects": vrio_entries,
             },
             "market_position": {
                 "position":             market_position,
@@ -1473,36 +1540,62 @@ async def get_market_intelligence(
         predictions      = []
         forecast_summary = {}
  
-    # ── Industry News / Trend signals ─────────────────────────────
-    news_location = request.location or "India"
-    category_lc = effective_category.lower()
-    category_news_term = f"{effective_category} news"
-    category_trend_term = f"{effective_category} food trends"
-    if "bar" in category_lc:
-        category_trend_term = f"{effective_category} beverage trends"
-    elif "cafe" in category_lc or "coffee" in category_lc:
-        category_trend_term = f"{effective_category} coffee trends"
+    # ── Business-specific News / Mention signals ──────────────────
+    news_location = request.location or request.city
+    business_query = (request.business_name or "").strip()
+    business_tokens = {
+        tok for tok in "".join(ch.lower() if ch.isalnum() else " " for ch in business_query).split()
+        if len(tok) > 2 and tok not in {"the", "and", "restaurant", "cafe", "bar"}
+    }
 
-    industry_queries = [
-        category_news_term,
-        category_trend_term,
-        f"{effective_category} consumer trends India",
-        f"{effective_category} market outlook India",
-        "restaurant industry news India",
-        "commercial LPG price hike restaurants India",
-        "LPG crisis restaurant industry India",
-        "food inflation restaurant industry India",
-        "food service supply chain disruption India",
+    def _normalize_tokens(text: str) -> set:
+        return {
+            tok for tok in "".join(ch.lower() if ch.isalnum() else " " for ch in (text or "")).split()
+            if len(tok) > 2
+        }
+
+    def _mentions_business(article: Dict[str, Any]) -> bool:
+        headline = article.get("headline", "")
+        snippet = article.get("snippet", "") or article.get("description", "")
+        link = article.get("link", "")
+        combined = f"{headline} {snippet} {link}".lower().strip()
+        if not combined:
+            return False
+        # Strong match: full business phrase appears in headline/snippet/url
+        if business_query and business_query.lower() in combined:
+            return True
+
+        combined_tokens = _normalize_tokens(combined)
+        overlap = len(business_tokens & combined_tokens)
+        if not business_tokens:
+            return False
+        # For short names, allow one token hit. For longer names, require stronger overlap.
+        if len(business_tokens) <= 2:
+            return overlap >= 1
+        return overlap >= max(2, int(len(business_tokens) * 0.5))
+
+    query_candidates = [
+        business_query,
+        f'"{business_query}"',
+        f'{business_query} restaurant',
+        f'"{business_query}" restaurant',
     ]
+    if news_location:
+        query_candidates.extend([
+            f'{business_query} {news_location}',
+            f'"{business_query}" {news_location}',
+        ])
+
+    industry_queries = list(dict.fromkeys([q.strip() for q in query_candidates if q and q.strip()]))
 
     query_results: Dict[str, List[Dict[str, Any]]] = {}
     try:
         query_results = scrape_multiple_queries(
             query_terms=industry_queries,
             location=news_location,
-            max_results_per_query=8,
+            max_results_per_query=10,
             exact_match=False,
-            include_location=False,
+            include_location=True,
         )
     except Exception as e:
         logger.error(f"Industry news scrape error: {e}")
@@ -1516,9 +1609,12 @@ async def get_market_intelligence(
             link = a.get("link")
             if not link or link in seen_links:
                 continue
+            headline = a.get("headline", "")
+            if not _mentions_business(a):
+                continue
             seen_links.add(link)
             articles.append({
-                "headline": a.get("headline", ""),
+                "headline": headline,
                 "link": link,
                 "source_name": a.get("source_name", "Unknown"),
                 "query": query_term,

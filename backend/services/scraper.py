@@ -127,16 +127,22 @@ def scrape_google_news_rss(
             title = item.find('title')
             link = item.find('link')
             source = item.find('source')
+            description = item.find('description')
+            pub_date = item.find('pubDate')
             
             if title is not None and link is not None:
                 headline = title.text
                 article_link = link.text
                 source_name = source.text if source is not None else "Unknown Source"
+                snippet = description.text if description is not None else ""
+                published_at = pub_date.text if pub_date is not None else None
                 
                 articles.append({
                     "headline": headline,
                     "link": article_link,
-                    "source_name": source_name
+                    "source_name": source_name,
+                    "snippet": snippet,
+                    "published_at": published_at,
                 })
                 
                 logger.debug(f"RSS: {headline[:50]}... from {source_name}")
