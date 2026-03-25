@@ -2,7 +2,7 @@
 CRUD operations — merged v1 + v2
 Covers all original tables (Business, Review, ReviewSentiment, Analysis,
 CompetitorAnalysis, InsightReport, AnalysisHistory, WebScrapingResult)
-plus all new v2 tables (ZomatoReview, ZomatoMenuItem, InstagramMention,
+plus all new v2 tables (SocialReview, SocialMenuItem,
 AggregatedABSA, FrameworkReport, ORMReview).
 """
 
@@ -75,27 +75,27 @@ def update_business(db: Session, business_id: int, **kwargs) -> Optional[models.
     return business
 
 
-def upsert_business_zomato_info(
+def upsert_business_social_info(
     db: Session,
     place_id: str,
-    zomato_url: str = None,
-    zomato_rating: float = None,
-    zomato_reviews_count: int = None,
+    social_profile_url: str = None,
+    social_rating: float = None,
+    social_reviews_count: int = None,
     photo_count: int = None,
     price_range: str = None,
     cuisine_tags: list = None,
     area: str = None,
 ) -> Optional[models.Business]:
-    """Update Zomato-specific fields on an existing Business record."""
+    """Update social-source fields on an existing Business record."""
     business = get_business_by_place_id(db, place_id)
     if not business:
         return None
-    if zomato_url is not None:
-        business.zomato_url = zomato_url
-    if zomato_rating is not None:
-        business.zomato_rating = zomato_rating
-    if zomato_reviews_count is not None:
-        business.zomato_reviews_count = zomato_reviews_count
+    if social_profile_url is not None:
+        business.social_profile_url = social_profile_url
+    if social_rating is not None:
+        business.social_rating = social_rating
+    if social_reviews_count is not None:
+        business.social_reviews_count = social_reviews_count
     if photo_count is not None:
         business.photo_count = photo_count
     if price_range is not None:
@@ -275,12 +275,12 @@ def get_latest_competitors(db: Session, business_id: int) -> List[models.Competi
     ).order_by(models.CompetitorAnalysis.rank).all()
 
 
-def update_competitor_zomato(
+def update_competitor_insights(
     db: Session,
     competitor_id: int,
-    zomato_url: str = None,
-    zomato_rating: float = None,
-    zomato_reviews: int = None,
+    social_url: str = None,
+    social_rating: float = None,
+    social_reviews: int = None,
     aspect_scores: dict = None,
     absa_summary: dict = None,
 ) -> Optional[models.CompetitorAnalysis]:
@@ -289,12 +289,12 @@ def update_competitor_zomato(
     ).first()
     if not row:
         return None
-    if zomato_url is not None:
-        row.competitor_zomato_url = zomato_url
-    if zomato_rating is not None:
-        row.competitor_zomato_rating = zomato_rating
-    if zomato_reviews is not None:
-        row.competitor_zomato_reviews = zomato_reviews
+    if social_url is not None:
+        row.competitor_social_url = social_url
+    if social_rating is not None:
+        row.competitor_social_rating = social_rating
+    if social_reviews is not None:
+        row.competitor_social_reviews = social_reviews
     if aspect_scores is not None:
         row.competitor_aspect_scores = aspect_scores
     if absa_summary is not None:
@@ -463,10 +463,10 @@ def delete_old_scraping_results(db: Session, days: int = 30) -> int:
 
 
 # ─────────────────────────────────────────────────────────────────────
-# ZOMATO REVIEWS
+# SOCIAL REVIEWS
 # ─────────────────────────────────────────────────────────────────────
 
-def create_zomato_review(
+def create_social_review(
     db: Session,
     business_id: int,
     review_text: str,
@@ -477,8 +477,8 @@ def create_zomato_review(
     date_is_estimated: bool = False,
     dining_type: str = "combined",
     absa_results: dict = None,
-) -> models.ZomatoReview:
-    review = models.ZomatoReview(
+) -> models.SocialReview:
+    review = models.SocialReview(
         business_id=business_id,
         review_text=review_text,
         author_name=author_name,
@@ -495,14 +495,14 @@ def create_zomato_review(
     return review
 
 
-def bulk_create_zomato_reviews(
+def bulk_create_social_reviews(
     db: Session, business_id: int, reviews: List[Dict[str, Any]]
 ) -> int:
-    """Insert many Zomato reviews. Returns count inserted."""
+    """Insert many social reviews. Returns count inserted."""
     count = 0
     for r in reviews:
         try:
-            create_zomato_review(
+            create_social_review(
                 db=db,
                 business_id=business_id,
                 review_text=r.get("review_text", ""),
@@ -520,22 +520,22 @@ def bulk_create_zomato_reviews(
     return count
 
 
-def get_zomato_reviews(
+def get_social_reviews(
     db: Session, business_id: int, limit: int = 500
-) -> List[models.ZomatoReview]:
+) -> List[models.SocialReview]:
     return (
-        db.query(models.ZomatoReview)
-        .filter(models.ZomatoReview.business_id == business_id)
-        .order_by(desc(models.ZomatoReview.review_date))
+        db.query(models.SocialReview)
+        .filter(models.SocialReview.business_id == business_id)
+        .order_by(desc(models.SocialReview.review_date))
         .limit(limit)
         .all()
     )
 
 
-def delete_zomato_reviews(db: Session, business_id: int) -> int:
+def delete_social_reviews(db: Session, business_id: int) -> int:
     deleted = (
-        db.query(models.ZomatoReview)
-        .filter(models.ZomatoReview.business_id == business_id)
+        db.query(models.SocialReview)
+        .filter(models.SocialReview.business_id == business_id)
         .delete()
     )
     db.commit()
@@ -543,21 +543,21 @@ def delete_zomato_reviews(db: Session, business_id: int) -> int:
 
 
 # ─────────────────────────────────────────────────────────────────────
-# ZOMATO MENU ITEMS
+# SOCIAL MENU ITEMS
 # ─────────────────────────────────────────────────────────────────────
 
 def upsert_menu_items(
     db: Session, business_id: int, items: List[Dict[str, Any]]
 ) -> int:
     """Delete existing menu items and insert fresh ones. Returns count."""
-    db.query(models.ZomatoMenuItem).filter(
-        models.ZomatoMenuItem.business_id == business_id
+    db.query(models.SocialMenuItem).filter(
+        models.SocialMenuItem.business_id == business_id
     ).delete()
     db.commit()
 
     count = 0
     for item in items:
-        mi = models.ZomatoMenuItem(
+        mi = models.SocialMenuItem(
             business_id=business_id,
             name=item.get("name", ""),
             price=item.get("price"),
@@ -575,104 +575,13 @@ def upsert_menu_items(
     return count
 
 
-def get_menu_items(db: Session, business_id: int) -> List[models.ZomatoMenuItem]:
+def get_menu_items(db: Session, business_id: int) -> List[models.SocialMenuItem]:
     return (
-        db.query(models.ZomatoMenuItem)
-        .filter(models.ZomatoMenuItem.business_id == business_id)
+        db.query(models.SocialMenuItem)
+        .filter(models.SocialMenuItem.business_id == business_id)
         .all()
     )
 
-
-# ─────────────────────────────────────────────────────────────────────
-# INSTAGRAM MENTIONS
-# ─────────────────────────────────────────────────────────────────────
-
-def upsert_instagram_mention(
-    db: Session,
-    business_id: int,
-    post_id: str,
-    caption: str = None,
-    hashtags: list = None,
-    post_url: str = None,
-    image_url: str = None,
-    like_count: int = 0,
-    comment_count: int = 0,
-    posted_at: datetime = None,
-    date_available: bool = True,
-    absa_results: dict = None,
-) -> models.InstagramMention:
-    existing = (
-        db.query(models.InstagramMention)
-        .filter(
-            models.InstagramMention.business_id == business_id,
-            models.InstagramMention.post_id == post_id,
-        )
-        .first()
-    )
-    if existing:
-        existing.like_count    = like_count
-        existing.comment_count = comment_count
-        if absa_results:
-            existing.absa_results = absa_results
-        db.commit()
-        db.refresh(existing)
-        return existing
-
-    mention = models.InstagramMention(
-        business_id=business_id,
-        post_id=post_id,
-        caption=caption,
-        hashtags=hashtags,
-        post_url=post_url,
-        image_url=image_url,
-        like_count=like_count,
-        comment_count=comment_count,
-        posted_at=posted_at,
-        date_available=date_available,
-        absa_results=absa_results,
-    )
-    db.add(mention)
-    db.commit()
-    db.refresh(mention)
-    return mention
-
-
-def bulk_upsert_instagram_mentions(
-    db: Session, business_id: int, posts: List[Dict[str, Any]]
-) -> int:
-    count = 0
-    for p in posts:
-        try:
-            upsert_instagram_mention(
-                db=db,
-                business_id=business_id,
-                post_id=p.get("post_id", ""),
-                caption=p.get("caption"),
-                hashtags=p.get("hashtags"),
-                post_url=p.get("post_url"),
-                image_url=p.get("image_url"),
-                like_count=p.get("like_count", 0),
-                comment_count=p.get("comment_count", 0),
-                posted_at=p.get("posted_at"),
-                date_available=p.get("date_available", True),
-                absa_results=p.get("absa_results"),
-            )
-            count += 1
-        except Exception:
-            db.rollback()
-    return count
-
-
-def get_instagram_mentions(
-    db: Session, business_id: int, limit: int = 500
-) -> List[models.InstagramMention]:
-    return (
-        db.query(models.InstagramMention)
-        .filter(models.InstagramMention.business_id == business_id)
-        .order_by(desc(models.InstagramMention.posted_at))
-        .limit(limit)
-        .all()
-    )
 
 
 # ─────────────────────────────────────────────────────────────────────

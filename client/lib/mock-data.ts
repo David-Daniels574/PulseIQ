@@ -27,10 +27,10 @@ export const reviewVolumeData = [
 
 export const sourceBreakdownData = [
   { source: "Google Maps", count: 612, percentage: 33 },
-  { source: "Zomato",      count: 487, percentage: 26 },
+  { source: "Twitter",     count: 487, percentage: 26 },
   { source: "TripAdvisor", count: 371, percentage: 20 },
   { source: "Yelp",        count: 224, percentage: 12 },
-  { source: "Instagram",   count: 153, percentage:  8 },
+  { source: "Reddit",      count: 153, percentage:  8 },
 ]
 
 export const sentimentAnalysis = {
@@ -245,10 +245,10 @@ export const ansoffMatrixData = {
 export const ormData = {
   reviews: [
     { id: 1, rating: 5, text: "Absolutely phenomenal experience! The truffle risotto was divine and the service was impeccable.", aspect: "Food", sentiment: "Positive", source: "Google Maps", date: "2026-03-24", status: "Responded" },
-    { id: 2, rating: 2, text: "Waited 45 minutes for our table despite having a reservation. Very disappointed.", aspect: "Service", sentiment: "Negative", source: "Zomato", date: "2026-03-23", status: "Pending" },
+    { id: 2, rating: 2, text: "Waited 45 minutes for our table despite having a reservation. Very disappointed.", aspect: "Service", sentiment: "Negative", source: "Twitter", date: "2026-03-23", status: "Pending" },
     { id: 3, rating: 4, text: "Great ambiance and food, but prices are a bit steep for the portion sizes.", aspect: "Price", sentiment: "Neutral", source: "Google Maps", date: "2026-03-22", status: "Responded" },
     { id: 4, rating: 5, text: "The chef's special was outstanding! Will definitely be back.", aspect: "Food", sentiment: "Positive", source: "TripAdvisor", date: "2026-03-21", status: "Pending" },
-    { id: 5, rating: 1, text: "Food was cold and the waiter was rude. Never coming back.", aspect: "Service", sentiment: "Negative", source: "Zomato", date: "2026-03-20", status: "Pending" },
+    { id: 5, rating: 1, text: "Food was cold and the waiter was rude. Never coming back.", aspect: "Service", sentiment: "Negative", source: "Twitter", date: "2026-03-20", status: "Pending" },
     { id: 6, rating: 4, text: "Beautiful interior and great cocktails. Food was good too!", aspect: "Ambiance", sentiment: "Positive", source: "Google Maps", date: "2026-03-19", status: "Responded" }
   ],
   analytics: {
@@ -261,7 +261,7 @@ export const ormData = {
 
 export const socialListeningData = {
   sources: [
-    { name: "Instagram", mentions: 234, change: 45, trend: "up", color: "#E4405F" },
+    { name: "Twitter/X", mentions: 234, change: 45, trend: "up", color: "#1DA1F2" },
     { name: "Twitter/X", mentions: 156, change: -12, trend: "down", color: "#1DA1F2" },
     { name: "Reddit", mentions: 89, change: 0, trend: "stable", color: "#FF4500" },
     { name: "Facebook", mentions: 178, change: 23, trend: "up", color: "#1877F2" },
@@ -279,7 +279,7 @@ export const socialListeningData = {
     "1k-10k": 34
   },
   recentMentions: [
-    { source: "Instagram", user: "@nycfoodie", text: "The truffle risotto at @goldenfork is absolutely incredible!", sentiment: "Positive", date: "2026-03-24" },
+    { source: "Twitter", user: "@nycfoodie", text: "The truffle risotto at @goldenfork is absolutely incredible!", sentiment: "Positive", date: "2026-03-24" },
     { source: "Twitter", user: "@foodcritic_ny", text: "Finally tried Golden Fork. Lived up to the hype!", sentiment: "Positive", date: "2026-03-23" },
     { source: "Reddit", user: "u/manhattandiner", text: "Is Golden Fork worth the price? Thinking of going for anniversary", sentiment: "Neutral", date: "2026-03-22" }
   ]
@@ -327,7 +327,7 @@ export const recommendations = [
     steps: [
       "Create branded hashtag #GoldenForkMoments",
       "Offer 10% discount for customers who post with hashtag",
-      "Feature best posts on restaurant Instagram",
+      "Feature best posts on restaurant social channels",
       "Partner with 3-5 micro-influencers for launch"
     ]
   },
@@ -409,14 +409,14 @@ export type SwotItem = {
 export const swotData: Record<"strengths" | "weaknesses" | "opportunities" | "threats", SwotItem[]> = {
   strengths: [
     { text: "Signature truffle risotto consistently rated best-in-class across all review platforms", confidence: "High", platform: "Google Maps", sourceText: "The truffle risotto here is absolutely divine — the best I've had in NYC. Rich, perfectly seasoned, and worth every penny.", sourceUrl: "#" },
-    { text: "Premium ambiance and interior design generates organic Instagram mentions", confidence: "High", platform: "Instagram", sourceText: "This place is so photogenic! The lighting and decor are stunning. #GoldenForkNYC", sourceUrl: "#" },
+    { text: "Premium ambiance and interior design generates organic social mentions", confidence: "High", platform: "Twitter", sourceText: "This place is so photogenic! The lighting and decor are stunning. #GoldenForkNYC", sourceUrl: "#" },
     { text: "Chef's farm-to-table positioning attracts high-value food critic coverage", confidence: "High", platform: "NY Times", sourceText: "Chef's commitment to hyper-local sourcing elevates every dish beyond mere fine dining.", sourceUrl: "#" },
     { text: "Creative cocktail and wine program differentiates from key competitors", confidence: "Medium", platform: "Google Maps", sourceText: "The sommelier recommendations were spot-on and the cocktail menu is inventive without being gimmicky.", sourceUrl: "#" },
-    { text: "Sunday brunch offering drives repeat visits and new customer acquisition", confidence: "Medium", platform: "Zomato", sourceText: "Best brunch in the neighborhood by far. We come every few weeks and always bring friends.", sourceUrl: "#" },
+    { text: "Sunday brunch offering drives repeat visits and new customer acquisition", confidence: "Medium", platform: "Twitter", sourceText: "Best brunch in the neighborhood by far. We come every few weeks and always bring friends.", sourceUrl: "#" },
   ],
   weaknesses: [
-    { text: "Long wait times during peak hours leading to customer frustration", confidence: "High", platform: "Zomato", sourceText: "Waited 45 minutes even with a reservation on Friday night. Management needs to get this under control.", sourceUrl: "#" },
-    { text: "Delivery experience is poor — cold food, late arrivals, packaging issues", confidence: "High", platform: "Zomato", sourceText: "Food arrived cold and 30 minutes late. Great dine-in experience but delivery is not worth it.", sourceUrl: "#" },
+    { text: "Long wait times during peak hours leading to customer frustration", confidence: "High", platform: "Twitter", sourceText: "Waited 45 minutes even with a reservation on Friday night. Management needs to get this under control.", sourceUrl: "#" },
+    { text: "Delivery experience is poor — cold food, late arrivals, packaging issues", confidence: "High", platform: "Twitter", sourceText: "Food arrived cold and 30 minutes late. Great dine-in experience but delivery is not worth it.", sourceUrl: "#" },
     { text: "Inconsistency in food quality across visits reported by repeat customers", confidence: "Medium", platform: "Google Maps", sourceText: "First visit was magical, second visit the same dish was noticeably worse. Needs more consistency.", sourceUrl: "#" },
     { text: "Limited parking availability reduces accessibility for non-transit customers", confidence: "Medium", platform: "Reddit", sourceText: "Great food but parking nearby is a nightmare. Lost 20 mins circling the block.", sourceUrl: "#" },
     { text: "Service staff attitude issues escalating in recent negative reviews", confidence: "Low", platform: "Yelp", sourceText: "Our waiter seemed annoyed the whole time. Felt like we were bothering him.", sourceUrl: "#" },
@@ -430,7 +430,7 @@ export const swotData: Record<"strengths" | "weaknesses" | "opportunities" | "th
   threats: [
     { text: "Three new upscale competitors opening within 0.5 miles in Q2 2026", confidence: "High", platform: "Local News", sourceText: "NYC restaurant boom: Three fine dining spots set to open in the area by April 2026, intensifying competition.", sourceUrl: "#" },
     { text: "Food cost inflation eroding margins — beef and seafood up 18% YoY", confidence: "High", platform: "Industry Report", sourceText: "Restaurant food costs hit a 5-year high in Q1 2026, with protein categories up 15-22% annually.", sourceUrl: "#" },
-    { text: "Zomato algorithm changes reducing organic discovery visibility", confidence: "Medium", platform: "Zomato", sourceText: "Restaurant owners in NYC report a 25% drop in organic profile views since the latest Zomato feed update.", sourceUrl: "#" },
+    { text: "Social feed algorithm changes reducing organic discovery visibility", confidence: "Medium", platform: "Twitter", sourceText: "Restaurant owners in NYC report a 25% drop in organic profile views since the latest feed update.", sourceUrl: "#" },
     { text: "Rising minimum wage in NYC tightening labor cost structure", confidence: "Medium", platform: "Policy Watch", sourceText: "NYC minimum wage set to increase to $18/hr by end of 2026, adding pressure to hospitality operating costs.", sourceUrl: "#" },
   ]
 }
@@ -477,6 +477,6 @@ export const pestelData: Record<string, { label: string; color: string; items: P
 export const fourPsData = {
   product: { score: 88, summary: "Strong product differentiation through premium ingredients and chef-led innovation. Signature dishes drive loyalty.", highlights: ["Truffle risotto and wagyu steak are category leaders in sentiment score (4.8-4.9/5)", "Seasonal rotating menu creates urgency and repeat visits", "Farm-to-table sourcing story gives authentic premium positioning", "Cocktail and wine program supports premium check average"], gaps: ["Delivery product experience is poor — packaging doesn't maintain quality", "Vegan/plant-based offering underdeveloped vs market demand"] },
   price: { score: 62, summary: "Pricing is premium but perception gap exists — customers feel value doesn't always match price point.", highlights: ["Price positioning correctly targets affluent NYC diner segment", "Chef's tasting menu provides anchor for daily a la carte pricing", "Wine program pricing in line with comparable fine dining"], gaps: ["50% of price-related reviews carry negative sentiment", "Lunch offering lacks accessible entry point for new customers", "Portion sizes flagged in 23% of value-related comments"] },
-  place: { score: 74, summary: "Prime location with strong foot traffic and transit access. Physical ambiance is a competitive strength.", highlights: ["Location generates organic walk-in traffic from neighborhood foot traffic", "Interior design cited as a reason to visit by 28% of reviewers", "Close to transit improves accessibility for non-driving diners"], gaps: ["No dedicated parking — limits suburban and outer-borough visitors", "Delivery radius is limited and experience is subpar", "Online presence (Zomato, Google) photos are outdated"] },
-  promotion: { score: 57, summary: "Offline presence is strong but digital and social media strategy is significantly underdeveloped.", highlights: ["Media coverage in NYT Food and Eater NY drives awareness", "Strong word-of-mouth with 40% of new customers via referral", "Chef's personal brand adds credibility"], gaps: ["No TikTok presence despite viral potential of food content", "Instagram posts averaging 3x lower engagement than competitor set", "Email marketing list underutilized — last campaign was 4 months ago", "Zero paid social media advertising"] }
+  place: { score: 74, summary: "Prime location with strong foot traffic and transit access. Physical ambiance is a competitive strength.", highlights: ["Location generates organic walk-in traffic from neighborhood foot traffic", "Interior design cited as a reason to visit by 28% of reviewers", "Close to transit improves accessibility for non-driving diners"], gaps: ["No dedicated parking — limits suburban and outer-borough visitors", "Delivery radius is limited and experience is subpar", "Online presence (Twitter, Google) photos are outdated"] },
+  promotion: { score: 57, summary: "Offline presence is strong but digital and social media strategy is significantly underdeveloped.", highlights: ["Media coverage in NYT Food and Eater NY drives awareness", "Strong word-of-mouth with 40% of new customers via referral", "Chef's personal brand adds credibility"], gaps: ["No TikTok presence despite viral potential of food content", "Twitter posts averaging 3x lower engagement than competitor set", "Email marketing list underutilized — last campaign was 4 months ago", "Zero paid social media advertising"] }
 }

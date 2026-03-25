@@ -1,7 +1,7 @@
 """
 Database Models — Full Schema (v2)
 Covers: existing tables (minimally changed) + all new tables for
-Zomato, Instagram, Framework Reports, ORM, Confidence metadata.
+social sources, Framework Reports, ORM, Confidence metadata.
 """
 
 from sqlalchemy import (
@@ -25,8 +25,7 @@ class SentimentEnum(str, enum.Enum):
 
 class SourceEnum(str, enum.Enum):
     google_maps = "google_maps"
-    zomato      = "zomato"
-    instagram   = "instagram"
+    twitter     = "twitter"
     news        = "news"
 
 class FrameworkEnum(str, enum.Enum):
@@ -42,7 +41,7 @@ class FrameworkEnum(str, enum.Enum):
 
 # ─────────────────────────────────────────────
 # EXISTING TABLE — Business  (extended)
-# Added: zomato_url, photo_count, price_range, cuisine_tags
+# Added: social profile metadata
 # ─────────────────────────────────────────────
 
 class Business(Base):
@@ -60,10 +59,11 @@ class Business(Base):
     rating         = Column(Float)
     total_reviews  = Column(Integer, default=0)
 
-    # ── Zomato-specific ──────────────────────── NEW
-    zomato_url     = Column(Text)                      # user-provided
-    zomato_rating  = Column(Float)
-    zomato_reviews_count = Column(Integer, default=0)
+    # ── Social source metadata ───────────────── NEW
+    # Compatibility mapping: these attributes map to legacy DB columns.
+    social_profile_url     = Column("zomato_url", Text)
+    social_rating          = Column("zomato_rating", Float)
+    social_reviews_count   = Column("zomato_reviews_count", Integer, default=0)
     photo_count    = Column(Integer, default=0)        # virality proxy
     price_range    = Column(String(50))                # e.g. "₹700 for two"
     cuisine_tags   = Column(JSON)                      # ["Continental","Mughlai"]
@@ -75,9 +75,8 @@ class Business(Base):
     reviews            = relationship("Review",             back_populates="business", cascade="all, delete-orphan")
     analyses           = relationship("Analysis",           back_populates="business", cascade="all, delete-orphan")
     competitor_records = relationship("CompetitorAnalysis", back_populates="main_business", cascade="all, delete-orphan")
-    zomato_reviews     = relationship("ZomatoReview",       back_populates="business", cascade="all, delete-orphan")  # NEW
-    zomato_menu_items  = relationship("ZomatoMenuItem",     back_populates="business", cascade="all, delete-orphan")  # NEW
-    instagram_mentions = relationship("InstagramMention",   back_populates="business", cascade="all, delete-orphan")  # NEW
+    social_reviews     = relationship("SocialReview",       back_populates="business", cascade="all, delete-orphan")
+    social_menu_items  = relationship("SocialMenuItem",     back_populates="business", cascade="all, delete-orphan")
     framework_reports  = relationship("FrameworkReport",    back_populates="business", cascade="all, delete-orphan")  # NEW
     orm_reviews        = relationship("ORMReview",          back_populates="business", cascade="all, delete-orphan")  # NEW
     web_scraping_results = relationship("WebScrapingResult", back_populates="business", cascade="all, delete-orphan")
@@ -144,7 +143,7 @@ class Analysis(Base):
     months_back = Column(Integer)                   # e.g. 6 (alternative to explicit dates)
 
     # ── Source breakdown ─────────────────────── NEW
-    # e.g. {"google_maps": 12, "zomato": 18, "instagram": 5}
+    # e.g. {"google_maps": 12, "twitter": 18}
     sources_used = Column(JSON)
 
     analyzed_at = Column(DateTime(timezone=True), server_default=func.now())
@@ -154,7 +153,7 @@ class Analysis(Base):
 
 # ─────────────────────────────────────────────
 # EXISTING TABLE — CompetitorAnalysis  (extended)
-# Added: zomato_url, zomato_rating, competitor_aspect_scores
+# Added: social source rating metadata and competitor_aspect_scores
 # ─────────────────────────────────────────────
 
 class CompetitorAnalysis(Base):
@@ -173,10 +172,11 @@ class CompetitorAnalysis(Base):
     search_radius       = Column(Integer)
     search_category     = Column(String(100))
 
-    # ── Zomato data for competitor ───────────── NEW
-    competitor_zomato_url          = Column(Text)
-    competitor_zomato_rating       = Column(Float)
-    competitor_zomato_reviews      = Column(Integer)
+    # ── Social source data for competitor ────── NEW
+    # Compatibility mapping: map to legacy competitor columns in existing DB.
+    competitor_social_url          = Column("competitor_zomato_url", Text)
+    competitor_social_rating       = Column("competitor_zomato_rating", Float)
+    competitor_social_reviews      = Column("competitor_zomato_reviews", Integer)
     # Aspect-level ABSA scores: {"Food": 3.8, "Service": 4.1, ...}
     competitor_aspect_scores       = Column(JSON)
     # Full lightweight ABSA result
@@ -188,11 +188,11 @@ class CompetitorAnalysis(Base):
 
 
 # ─────────────────────────────────────────────
-# NEW TABLE — ZomatoReview
-# Individual reviews scraped from Zomato
+# NEW TABLE — SocialReview
+# Individual reviews scraped from social platforms
 # ─────────────────────────────────────────────
 
-class ZomatoReview(Base):
+class SocialReview(Base):
     __tablename__ = "zomato_reviews"
 
     id           = Column(Integer, primary_key=True, index=True)
@@ -214,15 +214,15 @@ class ZomatoReview(Base):
     # {"Food": {"sentiment": "Positive", "score": 0.91, "sentence": "..."}, ...}
     absa_results = Column(JSON)
 
-    business = relationship("Business", back_populates="zomato_reviews")
+    business = relationship("Business", back_populates="social_reviews")
 
 
 # ─────────────────────────────────────────────
-# NEW TABLE — ZomatoMenuItem
-# Menu items scraped from Zomato (for BCG Matrix)
+# NEW TABLE — SocialMenuItem
+# Menu items inferred from social discussion (for BCG Matrix)
 # ─────────────────────────────────────────────
 
-class ZomatoMenuItem(Base):
+class SocialMenuItem(Base):
     __tablename__ = "zomato_menu_items"
 
     id          = Column(Integer, primary_key=True, index=True)
@@ -243,40 +243,8 @@ class ZomatoMenuItem(Base):
 
     scraped_at = Column(DateTime(timezone=True), server_default=func.now())
 
-    business = relationship("Business", back_populates="zomato_menu_items")
+    business = relationship("Business", back_populates="social_menu_items")
 
-
-# ─────────────────────────────────────────────
-# NEW TABLE — InstagramMention
-# Posts scraped via hashtag search
-# ─────────────────────────────────────────────
-
-class InstagramMention(Base):
-    __tablename__ = "instagram_mentions"
-
-    id          = Column(Integer, primary_key=True, index=True)
-    business_id = Column(Integer, ForeignKey("businesses.id", ondelete="CASCADE"), nullable=False)
-
-    post_id     = Column(String(255), unique=True)     # Instagram media id (dedup key)
-    caption     = Column(Text)
-    hashtags    = Column(JSON)                         # ["#leopoldcafe", "#colabafood"]
-    post_url    = Column(Text)
-    image_url   = Column(Text)
-
-    # Engagement signals (virality proxy)
-    like_count    = Column(Integer, default=0)
-    comment_count = Column(Integer, default=0)
-
-    # Date
-    posted_at      = Column(DateTime(timezone=True))
-    date_available = Column(Boolean, default=True)     # False if API couldn't return date
-
-    # ABSA on caption
-    absa_results = Column(JSON)    # same structure as ZomatoReview.absa_results
-
-    scraped_at = Column(DateTime(timezone=True), server_default=func.now())
-
-    business = relationship("Business", back_populates="instagram_mentions")
 
 
 # ─────────────────────────────────────────────
@@ -288,7 +256,7 @@ class InstagramMention(Base):
 class AggregatedABSA(Base):
     """
     Stores the per-aspect aggregated sentiment AFTER combining
-    Google Maps + Zomato + Instagram signals.
+    Google Maps + Twitter signals.
 
     confidence_score is the dynamic compound score (0-100).
     source_breakdown shows per-source contribution.
@@ -307,13 +275,12 @@ class AggregatedABSA(Base):
     # Per-source breakdown
     # {
     #   "google_maps": {"sentiment": "Positive", "score": 0.88, "mention_count": 12},
-    #   "zomato":      {"sentiment": "Positive", "score": 0.82, "mention_count": 18},
-    #   "instagram":   {"sentiment": "Neutral",  "score": 0.55, "mention_count": 5}
+    #   "twitter":     {"sentiment": "Positive", "score": 0.82, "mention_count": 18},
     # }
     source_breakdown = Column(JSON)
 
     conflict_flag    = Column(Boolean, default=False)
-    conflict_detail  = Column(Text)    # e.g. "Google Maps: Positive vs Zomato: Negative"
+    conflict_detail  = Column(Text)    # e.g. "Google Maps: Positive vs Twitter: Negative"
 
     # Pre-clustered complaint buckets for MECE (list of {cluster, sentences, count})
     mece_clusters    = Column(JSON)
@@ -342,7 +309,7 @@ class FrameworkReport(Base):
           "label": "...",
           "description": "...",
           "confidence": 82,          // 0-100
-          "sources": ["google_maps", "zomato"],
+              "sources": ["google_maps", "twitter"],
           "conflict": false
         },
         ...
@@ -359,7 +326,7 @@ class FrameworkReport(Base):
     result_json  = Column(JSON, nullable=False)                    # structured output (see docstring)
 
     # Which sources fed into this framework run
-    sources_used = Column(JSON)    # ["google_maps", "zomato", "instagram"]
+    sources_used = Column(JSON)    # ["google_maps", "twitter"]
 
     # Overall confidence for this framework (average of all point confidences)
     avg_confidence = Column(Float)

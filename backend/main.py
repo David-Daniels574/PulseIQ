@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field
 from typing import Optional, Dict, Any, List
 import uvicorn
 import logging
+from services.twitter_scraper import get_restaurant_reviews
 import os
 from dotenv import load_dotenv
 import googlemaps
@@ -16,12 +17,12 @@ from sqlalchemy.orm import Session
 from fastapi.middleware.cors import CORSMiddleware
 import nltk
 
+import logging
+logging.basicConfig(level=logging.INFO)
 from collections import Counter
 from datetime import timedelta
  
 # New service imports
-from services.zomato_scraper import scrape_zomato
-from services.instagram_scraper import scrape_instagram
 from services.confidence_engine import (
     compute_all_aspect_confidence,
     compute_sentiment_variance,
@@ -34,8 +35,7 @@ from analyzer import (
     analyze_review_for_aspects,
     analyze_multiple_reviews,
     download_nltk_data,
-    set_aspect_keywords_for_category,
-    get_available_categories
+    set_aspect_keywords_for_category
 )
 
 from llm_insights import (
@@ -155,7 +155,7 @@ class OverviewRequest(BaseModel):
     business_name: str = Field(..., description="Name of the restaurant")
     area: str          = Field(..., description="Area/neighbourhood e.g. 'Colaba'")
     city: str          = Field(..., description="City e.g. 'Mumbai'")
-    zomato_url: str    = Field(..., description="Full Zomato URL of the restaurant (user-provided)")
+    twitter_query: Optional[str] = Field(None, description="Optional specific query for Twitter. Defaults to business name.")
     months_back: Optional[int] = Field(6, ge=1, le=24, description="How many months of data to include (default 6)")
  
 class CompetitorRequest(BaseModel):
@@ -177,14 +177,6 @@ class BusinessResponse(BaseModel):
     rating: Optional[float]
     total_reviews: Optional[int]
     
-    # V2 Zomato Fields
-    zomato_url: Optional[str]
-    zomato_rating: Optional[float]
-    zomato_reviews_count: Optional[int]
-    photo_count: Optional[int]
-    price_range: Optional[str]
-    cuisine_tags: Optional[List[str]]
-
     model_config = ConfigDict(from_attributes=True) # orm_mode=True if using Pydantic v1
 
 class AggregatedABSAResponse(BaseModel):
@@ -328,46 +320,39 @@ async def analyze_business_overview(
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
     """
-    Overview page — aggregates Google Maps + Zomato + Instagram data,
+    Overview page - aggregates Google Maps + Twitter data,
     runs ABSA on all sources, computes confidence scores, and returns
     everything needed for the Overview dashboard.
- 
-    Returns:
-    - summary_stats: total_reviews, avg_rating, media_mentions, overall_confidence
-    - sentiment_breakdown: positive/neutral/negative percentages
-    - source_breakdown: review/mention counts per source
-    - review_volume_trend: monthly review counts (last N months)
-    - top_keywords: top-5 aspects by mention frequency
-    - aspect_sentiment: full ABSA breakdown per aspect with confidence scores
     """
     start_time = datetime.now()
-    logger.info(f"🚀 STARTING INSIGHTS PIPELINE FOR: {request.business_name}")
+    logger.info(f"STARTING INSIGHTS PIPELINE FOR: {request.business_name}")
+
     if not gmaps:
         raise HTTPException(status_code=503, detail="Google Maps API not configured")
- 
+
     try:
-        # ── Step 1: Resolve place via Google Maps ──────────────────
+        # Step 1: Resolve place via Google Maps
         query = f"{request.business_name} {request.area} {request.city}"
         places_result = gmaps.places(query=query)
         if not places_result.get("results"):
             raise HTTPException(status_code=404, detail=f"No business found: {query}")
- 
-        place        = places_result["results"][0]
-        place_id     = place["place_id"]
-        place_name   = place["name"]
-        place_addr   = place.get("formatted_address", "")
- 
+
+        place = places_result["results"][0]
+        place_id = place["place_id"]
+        place_name = place["name"]
+        place_addr = place.get("formatted_address", "")
+
         details = gmaps.place(
             place_id=place_id,
             fields=["name", "rating", "user_ratings_total", "reviews"],
         )
-        result_data   = details["result"]
-        gmap_reviews  = result_data.get("reviews", [])
-        gmap_rating   = result_data.get("rating", 0)
-        gmap_total    = result_data.get("user_ratings_total", 0)
-        logger.info(f"⏱️ Step 1 (Google Maps API)")
- 
-        # ── Step 2: DB upsert for Business ─────────────────────────
+        result_data = details["result"]
+        gmap_reviews = result_data.get("reviews", [])
+        gmap_rating = result_data.get("rating", 0)
+        gmap_total = result_data.get("user_ratings_total", 0)
+        logger.info("Step 1 complete (Google Maps API)")
+
+        # Step 2: DB upsert for business
         business_db = crud.get_or_create_business(
             db=db,
             place_id=place_id,
@@ -380,24 +365,15 @@ async def analyze_business_overview(
             rating=gmap_rating,
             total_reviews=gmap_total,
         )
-        crud.upsert_business_zomato_info(
-            db=db,
-            place_id=place_id,
-            zomato_url=request.zomato_url,
-            area=request.area,
-        )
-        logger.info(f"⏱️ Step 2 (DB Upsert Business)")
- 
-        # ── Step 3: Date cutoff ────────────────────────────────────
-        cutoff_dt = datetime.utcnow() - timedelta(days=request.months_back * 30)
- 
-        # ── Step 4: Google Maps ABSA ───────────────────────────────
+        logger.info("Step 2 complete (DB upsert business)")
+
+        # Step 3: ABSA setup
         set_aspect_keywords_for_category("restaurant")
- 
+
+        # Step 4: Google Maps ABSA + store reviews
         gmap_texts = [r["text"] for r in gmap_reviews if r.get("text")]
-        gmap_absa  = analyze_multiple_reviews(gmap_texts) if gmap_texts else {}
- 
-        # Store reviews
+        gmap_absa = analyze_multiple_reviews(gmap_texts) if gmap_texts else {}
+
         for r in gmap_reviews:
             if r.get("text"):
                 crud.create_review(
@@ -406,116 +382,80 @@ async def analyze_business_overview(
                     review_text=r["text"],
                     author_name=r.get("author_name"),
                     rating=r.get("rating"),
-                    review_date=(
-                        datetime.fromtimestamp(r["time"]) if r.get("time") else None
-                    ),
+                    review_date=(datetime.fromtimestamp(r["time"]) if r.get("time") else None),
                     source="google_maps",
                 )
-        logger.info(f"⏱️ Step 4 (Google Maps ABSA + Store Reviews)")
- 
-        # ── Step 5: Zomato scrape + ABSA ──────────────────────────
-        zomato_data   = scrape_zomato(request.zomato_url, months_back=request.months_back)
-        zomato_reviews = zomato_data.get("reviews", [])
-        zomato_info    = zomato_data.get("restaurant_info", {})
-        menu_items     = zomato_data.get("menu_items", [])
- 
-        crud.upsert_business_zomato_info(
-            db=db,
-            place_id=place_id,
-            zomato_rating=zomato_info.get("rating"),
-            zomato_reviews_count=zomato_info.get("review_count"),
-            photo_count=zomato_info.get("photo_count"),
-            price_range=zomato_info.get("price_range"),
-            cuisine_tags=zomato_info.get("cuisine_tags"),
-        )
-        crud.upsert_menu_items(db=db, business_id=business_db.id, items=menu_items)
- 
-        zomato_texts = [r["review_text"] for r in zomato_reviews if r.get("review_text")]
-        zomato_absa  = analyze_multiple_reviews(zomato_texts) if zomato_texts else {}
-        crud.bulk_create_zomato_reviews(db=db, business_id=business_db.id, reviews=zomato_reviews)
-        
-        logger.info(f"⏱️ Step 5 (Zomato Scrape + ABSA + Store Reviews)")
- 
-        # ── Step 6: Instagram scrape + ABSA ───────────────────────
-        insta_data   = scrape_instagram(
-            restaurant_name=request.business_name,
-            area=request.area,
-            city=request.city,
-            months_back=request.months_back,
-        )
-        insta_posts    = insta_data.get("posts", [])
-        virality_index = insta_data.get("virality_index", {})
- 
-        insta_captions = [p["caption"] for p in insta_posts if p.get("caption")]
-        insta_absa     = analyze_multiple_reviews(insta_captions) if insta_captions else {}
-        crud.bulk_upsert_instagram_mentions(db=db, business_id=business_db.id, posts=insta_posts)
-        
-        logger.info(f"⏱️ Step 6 (Instagram Scrape + ABSA + Store Mentions)")
- 
-        # ── Step 7: News mentions ──────────────────────────────────
-        news_articles = scrape_google_news(
-            query_term=request.business_name,
-            location=request.city,
-            max_results=20,
-        )
-        for article in news_articles:
-            crud.create_web_scraping_result(
-                db=db,
-                business_id=business_db.id,
-                query_term=request.business_name,
-                headline=article["headline"],
-                link=article["link"],
-                source_name=article["source_name"],
-            )
-        logger.info(f"⏱️ Step 7 (Google News Scrape + Store Results)")
- 
-        # ── Step 8: Confidence engine ──────────────────────────────
+        logger.info("Step 4 complete (Google Maps ABSA + store reviews)")
+
+        # Step 5: Twitter fetch + ABSA + store reviews
+        twitter_query = request.twitter_query or f"{request.business_name} {request.city}"
+        try:
+            twitter_reviews = get_restaurant_reviews(twitter_query) or []
+        except Exception as twitter_err:
+            logger.warning(f"Twitter scraper failed: {twitter_err}")
+            twitter_reviews = []
+
+        twitter_texts = [t.get("text", "").strip() for t in twitter_reviews if t.get("text")]
+        twitter_absa = analyze_multiple_reviews(twitter_texts) if twitter_texts else {}
+
+        for t in twitter_reviews:
+            text = t.get("text")
+            if text:
+                crud.create_review(
+                    db=db,
+                    business_id=business_db.id,
+                    review_text=text,
+                    author_name="twitter_user",
+                    rating=None,
+                    review_date=None,
+                    source="twitter",
+                )
+        logger.info("Step 5 complete (Twitter ABSA + store reviews)")
+
+        # Step 6: Build combined ABSA over all review text sources
+        all_review_texts = gmap_texts + twitter_texts
+        combined_absa = analyze_multiple_reviews(all_review_texts) if all_review_texts else {}
+
+        # Step 7: Confidence engine
         aggregated = compute_all_aspect_confidence(
             gmap_absa=gmap_absa,
-            zomato_absa=zomato_absa,
-            insta_absa=insta_absa,
+            twitter_absa=twitter_absa,
             months_back=request.months_back,
         )
         variances = compute_sentiment_variance(aggregated)
- 
-        # Collect negative sentences for MECE clustering
+
         negative_sentences = []
-        for src_name, src_absa in [
-            ("google_maps", gmap_absa),
-            ("zomato", zomato_absa),
-            ("instagram", insta_absa),
-        ]:
+        for src_name, src_absa in [("google_maps", gmap_absa), ("twitter", twitter_absa)]:
             for aspect, data in src_absa.items():
                 if isinstance(data, dict):
                     for detail in data.get("details", []):
                         if detail.get("sentiment") == "Negative":
-                            negative_sentences.append({
-                                "sentence":   detail.get("sentence", ""),
-                                "aspect":     aspect,
-                                "source":     src_name,
-                                "confidence": detail.get("score", 0.0),
-                            })
+                            negative_sentences.append(
+                                {
+                                    "sentence": detail.get("sentence", ""),
+                                    "aspect": aspect,
+                                    "source": src_name,
+                                    "confidence": detail.get("score", 0.0),
+                                }
+                            )
         mece_clusters = cluster_complaints(negative_sentences)
-        
-        logger.info(f"⏱️ Step 8 (Confidence Engine + MECE Clustering)")
- 
-        # ── Step 9: Store aggregated ABSA ─────────────────────────
+        logger.info("Step 7 complete (confidence + MECE clustering)")
+
+        # Step 8: Store aggregated ABSA
         analysis_db = crud.create_analysis(
             db=db,
             business_id=business_db.id,
             analysis_type="absa_full",
-            total_reviews_analyzed=len(gmap_texts) + len(zomato_texts) + len(insta_captions),
+            total_reviews_analyzed=len(all_review_texts),
             aspect_results={
+                "combined": combined_absa,
                 "google_maps": gmap_absa,
-                "zomato":      zomato_absa,
-                "instagram":   insta_absa,
+                "twitter": twitter_absa,
             },
             months_back=request.months_back,
             sources_used={
                 "google_maps": len(gmap_texts),
-                "zomato":      len(zomato_texts),
-                "instagram":   len(insta_captions),
-                "news":        len(news_articles),
+                "twitter": len(twitter_texts),
             },
         )
         crud.save_aggregated_absa(
@@ -526,107 +466,74 @@ async def analyze_business_overview(
             mece_clusters=mece_clusters,
             sentiment_variances=variances,
         )
-        
-        logger.info(f"⏱️ Step 9 (Store Aggregated ABSA Results)")
- 
-        # ── Step 10: Build response payload ───────────────────────
- 
-        # Overall sentiment across all sources
+        logger.info("Step 8 complete (store aggregated ABSA results)")
+
+        # Step 9: Build response payload
         all_sentiments = [a["overall_sentiment"] for a in aggregated]
         sentiment_counts = Counter(all_sentiments)
-        total_aspects    = len(all_sentiments) or 1
+        total_aspects = len(all_sentiments) or 1
         sentiment_breakdown = {
             "positive": round(sentiment_counts.get("Positive", 0) / total_aspects * 100, 1),
-            "neutral":  round(sentiment_counts.get("Neutral",  0) / total_aspects * 100, 1),
+            "neutral": round(sentiment_counts.get("Neutral", 0) / total_aspects * 100, 1),
             "negative": round(sentiment_counts.get("Negative", 0) / total_aspects * 100, 1),
         }
- 
-        # Overall confidence = average across all aspects
+
         overall_confidence = round(
             sum(a["confidence_score"] for a in aggregated) / (len(aggregated) or 1), 1
         )
- 
-        # Average rating across sources
-        ratings = [r for r in [gmap_rating, zomato_info.get("rating")] if r]
+
+        ratings = [r for r in [gmap_rating] if r]
         avg_rating = round(sum(ratings) / len(ratings), 2) if ratings else gmap_rating
- 
-        # Source breakdown
+
         source_breakdown = {
             "google_maps": {
                 "review_count": len(gmap_texts),
-                "avg_rating":   gmap_rating,
+                "avg_rating": gmap_rating,
                 "total_on_platform": gmap_total,
             },
-            "zomato": {
-                "review_count": len(zomato_texts),
-                "avg_rating":   zomato_info.get("rating"),
-                "photo_count":  zomato_info.get("photo_count", 0),
-                "price_range":  zomato_info.get("price_range"),
-                "cuisine_tags": zomato_info.get("cuisine_tags", []),
-            },
-            "instagram": {
-                "post_count":       virality_index.get("total_posts", 0),
-                "total_likes":      virality_index.get("total_likes", 0),
-                "total_comments":   virality_index.get("total_comments", 0),
-                "virality_score":   virality_index.get("virality_score", 0),
-                "virality_level":   virality_index.get("level", "Low"),
-            },
-            "news": {
-                "article_count": len(news_articles),
+            "twitter": {
+                "review_count": len(twitter_texts),
+                "query_used": twitter_query,
             },
         }
-        
-        logger.info(f"⏱️ Step 10 (Build Response Payload)")
- 
-        # Review Volume Trend — monthly count across Google Maps + Zomato
-        # Build a dict {YYYY-MM: count}
+
         month_buckets: Dict[str, int] = {}
         for r in gmap_reviews:
             if r.get("time"):
                 dt = datetime.fromtimestamp(r["time"])
                 key = dt.strftime("%Y-%m")
                 month_buckets[key] = month_buckets.get(key, 0) + 1
-        for r in zomato_reviews:
-            if r.get("review_date") and not r.get("date_is_estimated"):
-                key = r["review_date"].strftime("%Y-%m")
-                month_buckets[key] = month_buckets.get(key, 0) + 1
- 
-        # Keep only last N months, sorted
+
         sorted_months = sorted(month_buckets.keys())
-        review_volume_trend = [
-            {"month": m, "count": month_buckets[m]}
-            for m in sorted_months
-        ]
- 
-        # Top-5 aspects by mention count (across all sources)
+        review_volume_trend = [{"month": m, "count": month_buckets[m]} for m in sorted_months]
+
         aspect_mention_counts: Dict[str, int] = {}
-        for src_absa in [gmap_absa, zomato_absa, insta_absa]:
+        for src_absa in [gmap_absa, twitter_absa]:
             for aspect, data in src_absa.items():
                 if isinstance(data, dict):
                     aspect_mention_counts[aspect] = (
                         aspect_mention_counts.get(aspect, 0) + data.get("total_mentions", 0)
                     )
+
         top_keywords = sorted(
             [{"keyword": k, "count": v} for k, v in aspect_mention_counts.items()],
             key=lambda x: x["count"],
             reverse=True,
         )[:5]
- 
-        # Full aspect-sentiment breakdown with confidence
+
         aspect_sentiment = [
             {
-                "aspect":            a["aspect"],
+                "aspect": a["aspect"],
                 "overall_sentiment": a["overall_sentiment"],
-                "confidence_score":  a["confidence_score"],
-                "conflict":          a["conflict_flag"],
-                "conflict_detail":   a.get("conflict_detail"),
-                "source_breakdown":  a.get("source_breakdown", {}),
-                "mention_count":     aspect_mention_counts.get(a["aspect"], 0),
+                "confidence_score": a["confidence_score"],
+                "conflict": a["conflict_flag"],
+                "conflict_detail": a.get("conflict_detail"),
+                "source_breakdown": a.get("source_breakdown", {}),
+                "mention_count": aspect_mention_counts.get(a["aspect"], 0),
             }
             for a in aggregated
         ]
- 
-        # Log
+
         execution_time = int((datetime.now() - start_time).total_seconds() * 1000)
         crud.log_analysis(
             db=db,
@@ -637,35 +544,31 @@ async def analyze_business_overview(
             status="success",
             execution_time_ms=execution_time,
         )
- 
+
         return {
             "status": "success",
             "business_info": {
-                "name":          place_name,
-                "area":          request.area,
-                "city":          request.city,
-                "address":       place_addr,
-                "place_id":      place_id,
-                "zomato_url":    request.zomato_url,
-                "cuisine_tags":  zomato_info.get("cuisine_tags", []),
-                "price_range":   zomato_info.get("price_range"),
-                "months_back":   request.months_back,
+                "name": place_name,
+                "area": request.area,
+                "city": request.city,
+                "address": place_addr,
+                "place_id": place_id,
+                "twitter_query_used": twitter_query,
+                "months_back": request.months_back,
             },
             "summary_stats": {
-                "total_reviews":      len(gmap_texts) + len(zomato_texts),
-                "avg_rating":         avg_rating,
-                "media_mentions":     len(news_articles),
-                "instagram_posts":    virality_index.get("total_posts", 0),
+                "total_reviews": len(all_review_texts),
+                "avg_rating": avg_rating,
                 "overall_confidence": overall_confidence,
             },
-            "sentiment_breakdown":  sentiment_breakdown,
-            "source_breakdown":     source_breakdown,
-            "review_volume_trend":  review_volume_trend,
-            "top_keywords":         top_keywords,
-            "aspect_sentiment":     aspect_sentiment,
-            "execution_time_ms":    execution_time,
+            "sentiment_breakdown": sentiment_breakdown,
+            "source_breakdown": source_breakdown,
+            "review_volume_trend": review_volume_trend,
+            "top_keywords": top_keywords,
+            "aspect_sentiment": aspect_sentiment,
+            "execution_time_ms": execution_time,
         }
- 
+
     except HTTPException:
         raise
     except Exception as e:
@@ -673,10 +576,14 @@ async def analyze_business_overview(
         execution_time = int((datetime.now() - start_time).total_seconds() * 1000)
         try:
             crud.log_analysis(
-                db=db, business_name=request.business_name,
-                category="restaurant", location=request.city,
-                endpoint="/analyze/business/insights", status="failed",
-                error_message=str(e), execution_time_ms=execution_time,
+                db=db,
+                business_name=request.business_name,
+                category="restaurant",
+                location=request.city,
+                endpoint="/analyze/business/insights",
+                status="failed",
+                error_message=str(e),
+                execution_time_ms=execution_time,
             )
         except Exception:
             pass
@@ -876,7 +783,7 @@ async def analyze_competitors(
                 search_radius=request.radius,
                 search_category=request.category,
             )
-            crud.update_competitor_zomato(
+            crud.update_competitor_insights(
                 db=db,
                 competitor_id=comp_record.id,
                 aspect_scores=comp_scores,
@@ -901,7 +808,7 @@ async def analyze_competitors(
             crud.get_latest_analysis(db, main_db.id, "absa")
         )
         if main_analysis and main_analysis.aspect_results:
-            # aspect_results may be nested {google_maps: {...}, zomato: {...}}
+            # aspect_results may be nested by source, e.g. {google_maps: {...}, twitter: {...}}
             ar = main_analysis.aspect_results
             if "google_maps" in ar:
                 combined_absa: Dict[str, Any] = {}

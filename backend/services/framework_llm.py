@@ -64,7 +64,7 @@ def build_frameworks_prompt(
         '  "label":       "<short title>",\n'
         '  "description": "<2-3 sentence explanation citing data>",\n'
         '  "confidence":  <0-100 integer based on source confidence scores>,\n'
-        '  "sources":     ["google_maps", "zomato", "instagram", "news"],\n'
+        '  "sources":     ["google_maps", "twitter", "news"],\n'
         '  "conflict":    <true if sources disagree on this point>\n'
         '}'
     )
@@ -133,7 +133,7 @@ def build_frameworks_prompt(
         + menu_json + "\n\n"
 
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "INSTAGRAM VIRALITY INDEX\n"
+        "SOCIAL SIGNAL INDEX\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         + virality_json + "\n\n"
 
@@ -363,9 +363,7 @@ def generate_all_frameworks(
                 if fw in frameworks
             }
 
-            sources_used = ["google_maps", "zomato"]
-            if virality_index.get("total_posts", 0) > 0:
-                sources_used.append("instagram")
+            sources_used = ["google_maps", "twitter"]
             if news_mentions:
                 sources_used.append("news")
 

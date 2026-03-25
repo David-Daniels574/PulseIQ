@@ -1,7 +1,7 @@
 """
 Confidence Scoring Engine
 Computes a dynamic compound confidence score (0-100) per aspect
-across all sources: Google Maps, Zomato, Instagram, News.
+across all sources: Google Maps, Twitter, News.
 
 Factors:
   1. Source base weight
@@ -15,7 +15,7 @@ Factors:
 import math
 import logging
 import statistics
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Dict, Any, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
@@ -26,8 +26,7 @@ logger = logging.getLogger(__name__)
 
 SOURCE_WEIGHTS = {
     "google_maps": 0.90,
-    "zomato":      0.85,
-    "instagram":   0.55,
+    "twitter":     0.80,
     "news":        0.65,
 }
 
@@ -221,19 +220,17 @@ def compute_aspect_confidence(
 # ─────────────────────────────────────────────────────────────────────
 
 def compute_all_aspect_confidence(
-    gmap_absa:   Dict[str, Any],
-    zomato_absa: Dict[str, Any],
-    insta_absa:  Dict[str, Any],
+    gmap_absa: Dict[str, Any],
+    twitter_absa: Dict[str, Any],
     months_back: int = 6,
 ) -> List[Dict[str, Any]]:
     """
-    Given ABSA results from all three sources, compute compound
+    Given ABSA results from sources, compute compound
     confidence for every aspect that appears in at least one source.
 
     Args:
-        gmap_absa:   output of analyze_multiple_reviews()  (Google Maps)
-        zomato_absa: output of analyze_multiple_reviews()  (Zomato)
-        insta_absa:  output of analyze_multiple_reviews()  (Instagram captions)
+        gmap_absa: output of analyze_multiple_reviews()  (Google Maps)
+        twitter_absa: output of analyze_multiple_reviews()  (Twitter)
         months_back: for recency weighting
 
     Returns:
@@ -249,29 +246,22 @@ def compute_all_aspect_confidence(
                 "sentiment":       data.get("overall_sentiment", "Neutral"),
                 "avg_model_score": data.get("average_confidence", 0.7),
                 "mention_count":   data.get("total_mentions", 0),
-                "avg_review_date": None,   # per-source avg date not available here
+                "avg_review_date": None,
             }
         return result
 
-    gmap_by_aspect   = extract_source_data(gmap_absa)
-    zomato_by_aspect = extract_source_data(zomato_absa)
-    insta_by_aspect  = extract_source_data(insta_absa)
+    gmap_by_aspect = extract_source_data(gmap_absa)
+    twitter_by_aspect = extract_source_data(twitter_absa)
 
-    all_aspects = (
-        set(gmap_by_aspect.keys()) |
-        set(zomato_by_aspect.keys()) |
-        set(insta_by_aspect.keys())
-    )
+    all_aspects = set(gmap_by_aspect.keys()) | set(twitter_by_aspect.keys())
 
     results: List[Dict[str, Any]] = []
     for aspect in sorted(all_aspects):
         source_data: Dict[str, Dict[str, Any]] = {}
         if aspect in gmap_by_aspect:
             source_data["google_maps"] = gmap_by_aspect[aspect]
-        if aspect in zomato_by_aspect:
-            source_data["zomato"] = zomato_by_aspect[aspect]
-        if aspect in insta_by_aspect:
-            source_data["instagram"] = insta_by_aspect[aspect]
+        if aspect in twitter_by_aspect:
+            source_data["twitter"] = twitter_by_aspect[aspect]
 
         conf = compute_aspect_confidence(aspect, source_data, months_back)
         results.append(conf)

@@ -41,7 +41,7 @@ const features = [
   {
     icon: Smartphone,
     title: "Social Listening",
-    description: "Monitor mentions across Instagram, Twitter, Reddit, and other social platforms."
+    description: "Monitor mentions across Twitter, Reddit, and other social platforms."
   },
   {
     icon: FileText,
