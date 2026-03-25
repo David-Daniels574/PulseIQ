@@ -16,3 +16,24 @@ xgboost
 pandas
 scikit-learn
 chromadb
+
+# ── New dependencies ───────────────────────────────────────────────
+ 
+# Zomato scraping
+selenium                  # headless browser fallback for Zomato
+webdriver-manager         # auto-downloads the correct ChromeDriver
+python-dateutil           # robust date parsing ("2 months ago" → datetime)
+lxml                      # faster HTML parser for BeautifulSoup
+ 
+# Instagram scraping (unofficial, no auth needed for public hashtags)
+instagrapi                # unofficial Instagram private API wrapper
+ 
+# Confidence engine / MECE clustering
+# scikit-learn already listed above (TF-IDF + cosine similarity)
+ 
+# PDF export (boardroom report)
+reportlab                 # PDF generation
+Pillow                    # image handling inside PDFs
+ 
+# Alembic for DB migrations (already listed but pinning here for clarity)
+alembic

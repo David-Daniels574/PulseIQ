@@ -1,5 +1,9 @@
 """
-CRUD operations for database models
+CRUD operations — merged v1 + v2
+Covers all original tables (Business, Review, ReviewSentiment, Analysis,
+CompetitorAnalysis, InsightReport, AnalysisHistory, WebScrapingResult)
+plus all new v2 tables (ZomatoReview, ZomatoMenuItem, InstagramMention,
+AggregatedABSA, FrameworkReport, ORMReview).
 """
 
 from sqlalchemy.orm import Session
@@ -9,7 +13,9 @@ from datetime import datetime
 import db_models as models
 
 
-# ============ BUSINESS CRUD ============
+# ─────────────────────────────────────────────────────────────────────
+# BUSINESS
+# ─────────────────────────────────────────────────────────────────────
 
 def create_business(
     db: Session,
@@ -21,9 +27,8 @@ def create_business(
     latitude: float = None,
     longitude: float = None,
     rating: float = None,
-    total_reviews: int = 0
+    total_reviews: int = 0,
 ) -> models.Business:
-    """Create a new business record"""
     business = models.Business(
         place_id=place_id,
         name=name,
@@ -33,7 +38,7 @@ def create_business(
         latitude=latitude,
         longitude=longitude,
         rating=rating,
-        total_reviews=total_reviews
+        total_reviews=total_reviews,
     )
     db.add(business)
     db.commit()
@@ -42,28 +47,24 @@ def create_business(
 
 
 def get_business_by_place_id(db: Session, place_id: str) -> Optional[models.Business]:
-    """Get business by Google Maps place_id"""
     return db.query(models.Business).filter(models.Business.place_id == place_id).first()
 
 
 def get_business_by_name(db: Session, name: str, location: str) -> Optional[models.Business]:
-    """Get business by name and location (case-insensitive)"""
     return db.query(models.Business).filter(
         models.Business.name.ilike(f"%{name}%"),
-        models.Business.location.ilike(f"%{location}%")
+        models.Business.location.ilike(f"%{location}%"),
     ).first()
 
 
 def get_or_create_business(db: Session, place_id: str, **kwargs) -> models.Business:
-    """Get existing business or create new one"""
     business = get_business_by_place_id(db, place_id)
     if not business:
         business = create_business(db, place_id, **kwargs)
     return business
 
 
-def update_business(db: Session, business_id: int, **kwargs) -> models.Business:
-    """Update business information"""
+def update_business(db: Session, business_id: int, **kwargs) -> Optional[models.Business]:
     business = db.query(models.Business).filter(models.Business.id == business_id).first()
     if business:
         for key, value in kwargs.items():
@@ -74,12 +75,47 @@ def update_business(db: Session, business_id: int, **kwargs) -> models.Business:
     return business
 
 
+def upsert_business_zomato_info(
+    db: Session,
+    place_id: str,
+    zomato_url: str = None,
+    zomato_rating: float = None,
+    zomato_reviews_count: int = None,
+    photo_count: int = None,
+    price_range: str = None,
+    cuisine_tags: list = None,
+    area: str = None,
+) -> Optional[models.Business]:
+    """Update Zomato-specific fields on an existing Business record."""
+    business = get_business_by_place_id(db, place_id)
+    if not business:
+        return None
+    if zomato_url is not None:
+        business.zomato_url = zomato_url
+    if zomato_rating is not None:
+        business.zomato_rating = zomato_rating
+    if zomato_reviews_count is not None:
+        business.zomato_reviews_count = zomato_reviews_count
+    if photo_count is not None:
+        business.photo_count = photo_count
+    if price_range is not None:
+        business.price_range = price_range
+    if cuisine_tags is not None:
+        business.cuisine_tags = cuisine_tags
+    if area is not None:
+        business.area = area
+    db.commit()
+    db.refresh(business)
+    return business
+
+
 def get_all_businesses(db: Session, skip: int = 0, limit: int = 100) -> List[models.Business]:
-    """Get all businesses with pagination"""
     return db.query(models.Business).offset(skip).limit(limit).all()
 
 
-# ============ REVIEW CRUD ============
+# ─────────────────────────────────────────────────────────────────────
+# GOOGLE MAPS REVIEWS
+# ─────────────────────────────────────────────────────────────────────
 
 def create_review(
     db: Session,
@@ -88,16 +124,15 @@ def create_review(
     author_name: str = None,
     rating: float = None,
     review_date: datetime = None,
-    source: str = "google_maps"
+    source: str = "google_maps",
 ) -> models.Review:
-    """Create a new review"""
     review = models.Review(
         business_id=business_id,
         review_text=review_text,
         author_name=author_name,
         rating=rating,
         review_date=review_date,
-        source=source
+        source=source,
     )
     db.add(review)
     db.commit()
@@ -106,11 +141,12 @@ def create_review(
 
 
 def get_reviews_by_business(db: Session, business_id: int) -> List[models.Review]:
-    """Get all reviews for a business"""
     return db.query(models.Review).filter(models.Review.business_id == business_id).all()
 
 
-# ============ REVIEW SENTIMENT CRUD ============
+# ─────────────────────────────────────────────────────────────────────
+# REVIEW SENTIMENT
+# ─────────────────────────────────────────────────────────────────────
 
 def create_review_sentiment(
     db: Session,
@@ -118,30 +154,30 @@ def create_review_sentiment(
     aspect: str,
     sentiment: str,
     confidence_score: float,
-    sentence: str = None
+    sentence: str = None,
 ) -> models.ReviewSentiment:
-    """Create a sentiment record for a review"""
-    sentiment_record = models.ReviewSentiment(
+    record = models.ReviewSentiment(
         review_id=review_id,
         aspect=aspect,
         sentiment=sentiment,
         confidence_score=confidence_score,
-        sentence=sentence
+        sentence=sentence,
     )
-    db.add(sentiment_record)
+    db.add(record)
     db.commit()
-    db.refresh(sentiment_record)
-    return sentiment_record
+    db.refresh(record)
+    return record
 
 
 def get_sentiments_by_review(db: Session, review_id: int) -> List[models.ReviewSentiment]:
-    """Get all sentiments for a review"""
     return db.query(models.ReviewSentiment).filter(
         models.ReviewSentiment.review_id == review_id
     ).all()
 
 
-# ============ ANALYSIS CRUD ============
+# ─────────────────────────────────────────────────────────────────────
+# ANALYSIS
+# ─────────────────────────────────────────────────────────────────────
 
 def create_analysis(
     db: Session,
@@ -150,16 +186,24 @@ def create_analysis(
     total_reviews_analyzed: int,
     aspect_results: Dict[str, Any],
     overall_sentiment: str = None,
-    average_rating: float = None
+    average_rating: float = None,
+    # v2 extensions — optional so existing callers don't break
+    date_from: datetime = None,
+    date_to: datetime = None,
+    months_back: int = None,
+    sources_used: Dict[str, int] = None,
 ) -> models.Analysis:
-    """Create an analysis record"""
     analysis = models.Analysis(
         business_id=business_id,
         analysis_type=analysis_type,
         total_reviews_analyzed=total_reviews_analyzed,
         aspect_results=aspect_results,
         overall_sentiment=overall_sentiment,
-        average_rating=average_rating
+        average_rating=average_rating,
+        date_from=date_from,
+        date_to=date_to,
+        months_back=months_back,
+        sources_used=sources_used,
     )
     db.add(analysis)
     db.commit()
@@ -167,22 +211,24 @@ def create_analysis(
     return analysis
 
 
-def get_latest_analysis(db: Session, business_id: int, analysis_type: str = "absa") -> Optional[models.Analysis]:
-    """Get the most recent analysis for a business"""
+def get_latest_analysis(
+    db: Session, business_id: int, analysis_type: str = "absa"
+) -> Optional[models.Analysis]:
     return db.query(models.Analysis).filter(
         models.Analysis.business_id == business_id,
-        models.Analysis.analysis_type == analysis_type
+        models.Analysis.analysis_type == analysis_type,
     ).order_by(desc(models.Analysis.analyzed_at)).first()
 
 
 def get_all_analyses(db: Session, business_id: int) -> List[models.Analysis]:
-    """Get all analyses for a business"""
     return db.query(models.Analysis).filter(
         models.Analysis.business_id == business_id
     ).order_by(desc(models.Analysis.analyzed_at)).all()
 
 
-# ============ COMPETITOR ANALYSIS CRUD ============
+# ─────────────────────────────────────────────────────────────────────
+# COMPETITOR ANALYSIS
+# ─────────────────────────────────────────────────────────────────────
 
 def create_competitor_analysis(
     db: Session,
@@ -196,10 +242,9 @@ def create_competitor_analysis(
     rating_difference: float,
     review_difference: int,
     search_radius: int,
-    search_category: str
+    search_category: str,
 ) -> models.CompetitorAnalysis:
-    """Create a competitor analysis record"""
-    competitor = models.CompetitorAnalysis(
+    record = models.CompetitorAnalysis(
         main_business_id=main_business_id,
         competitor_place_id=competitor_place_id,
         competitor_name=competitor_name,
@@ -210,31 +255,58 @@ def create_competitor_analysis(
         rating_difference=rating_difference,
         review_difference=review_difference,
         search_radius=search_radius,
-        search_category=search_category
+        search_category=search_category,
     )
-    db.add(competitor)
+    db.add(record)
     db.commit()
-    db.refresh(competitor)
-    return competitor
+    db.refresh(record)
+    return record
 
 
 def get_latest_competitors(db: Session, business_id: int) -> List[models.CompetitorAnalysis]:
-    """Get the most recent competitor analysis"""
-    # Get the latest analysis timestamp
-    latest_analysis = db.query(func.max(models.CompetitorAnalysis.analyzed_at)).filter(
+    latest_ts = db.query(func.max(models.CompetitorAnalysis.analyzed_at)).filter(
         models.CompetitorAnalysis.main_business_id == business_id
     ).scalar()
-    
-    if not latest_analysis:
+    if not latest_ts:
         return []
-    
     return db.query(models.CompetitorAnalysis).filter(
         models.CompetitorAnalysis.main_business_id == business_id,
-        models.CompetitorAnalysis.analyzed_at == latest_analysis
+        models.CompetitorAnalysis.analyzed_at == latest_ts,
     ).order_by(models.CompetitorAnalysis.rank).all()
 
 
-# ============ INSIGHT REPORT CRUD ============
+def update_competitor_zomato(
+    db: Session,
+    competitor_id: int,
+    zomato_url: str = None,
+    zomato_rating: float = None,
+    zomato_reviews: int = None,
+    aspect_scores: dict = None,
+    absa_summary: dict = None,
+) -> Optional[models.CompetitorAnalysis]:
+    row = db.query(models.CompetitorAnalysis).filter(
+        models.CompetitorAnalysis.id == competitor_id
+    ).first()
+    if not row:
+        return None
+    if zomato_url is not None:
+        row.competitor_zomato_url = zomato_url
+    if zomato_rating is not None:
+        row.competitor_zomato_rating = zomato_rating
+    if zomato_reviews is not None:
+        row.competitor_zomato_reviews = zomato_reviews
+    if aspect_scores is not None:
+        row.competitor_aspect_scores = aspect_scores
+    if absa_summary is not None:
+        row.competitor_absa_summary = absa_summary
+    db.commit()
+    db.refresh(row)
+    return row
+
+
+# ─────────────────────────────────────────────────────────────────────
+# INSIGHT REPORT
+# ─────────────────────────────────────────────────────────────────────
 
 def create_insight_report(
     db: Session,
@@ -247,9 +319,13 @@ def create_insight_report(
     priority_actions: Dict = None,
     full_insights_text: str = None,
     rag_enabled: bool = False,
-    reviews_retrieved: int = 0
+    reviews_retrieved: int = 0,
+    # v2 extensions
+    framework_report_ids: list = None,
+    date_from: datetime = None,
+    date_to: datetime = None,
+    months_back: int = None,
 ) -> models.InsightReport:
-    """Create an insight report"""
     report = models.InsightReport(
         business_id=business_id,
         executive_summary=executive_summary,
@@ -260,7 +336,11 @@ def create_insight_report(
         priority_actions=priority_actions,
         full_insights_text=full_insights_text,
         rag_enabled=rag_enabled,
-        reviews_retrieved=reviews_retrieved
+        reviews_retrieved=reviews_retrieved,
+        framework_report_ids=framework_report_ids,
+        date_from=date_from,
+        date_to=date_to,
+        months_back=months_back,
     )
     db.add(report)
     db.commit()
@@ -269,13 +349,14 @@ def create_insight_report(
 
 
 def get_latest_insight_report(db: Session, business_id: int) -> Optional[models.InsightReport]:
-    """Get the most recent insight report"""
     return db.query(models.InsightReport).filter(
         models.InsightReport.business_id == business_id
     ).order_by(desc(models.InsightReport.generated_at)).first()
 
 
-# ============ ANALYSIS HISTORY CRUD ============
+# ─────────────────────────────────────────────────────────────────────
+# ANALYSIS HISTORY
+# ─────────────────────────────────────────────────────────────────────
 
 def log_analysis(
     db: Session,
@@ -285,9 +366,8 @@ def log_analysis(
     endpoint: str,
     status: str,
     error_message: str = None,
-    execution_time_ms: int = None
+    execution_time_ms: int = None,
 ) -> models.AnalysisHistory:
-    """Log an analysis request to history"""
     history = models.AnalysisHistory(
         business_name=business_name,
         category=category,
@@ -295,7 +375,7 @@ def log_analysis(
         endpoint=endpoint,
         status=status,
         error_message=error_message,
-        execution_time_ms=execution_time_ms
+        execution_time_ms=execution_time_ms,
     )
     db.add(history)
     db.commit()
@@ -304,28 +384,23 @@ def log_analysis(
 
 
 def get_analysis_history(db: Session, limit: int = 50) -> List[models.AnalysisHistory]:
-    """Get recent analysis history"""
     return db.query(models.AnalysisHistory).order_by(
         desc(models.AnalysisHistory.created_at)
     ).limit(limit).all()
 
 
 def get_business_statistics(db: Session) -> Dict[str, Any]:
-    """Get overall database statistics"""
-    total_businesses = db.query(func.count(models.Business.id)).scalar()
-    total_reviews = db.query(func.count(models.Review.id)).scalar()
-    total_analyses = db.query(func.count(models.Analysis.id)).scalar()
-    total_insights = db.query(func.count(models.InsightReport.id)).scalar()
-    
     return {
-        "total_businesses": total_businesses,
-        "total_reviews": total_reviews,
-        "total_analyses": total_analyses,
-        "total_insight_reports": total_insights,
+        "total_businesses":     db.query(func.count(models.Business.id)).scalar(),
+        "total_reviews":        db.query(func.count(models.Review.id)).scalar(),
+        "total_analyses":       db.query(func.count(models.Analysis.id)).scalar(),
+        "total_insight_reports": db.query(func.count(models.InsightReport.id)).scalar(),
     }
 
 
-# ============ WEB SCRAPING CRUD ============
+# ─────────────────────────────────────────────────────────────────────
+# WEB SCRAPING (Google News)
+# ─────────────────────────────────────────────────────────────────────
 
 def create_web_scraping_result(
     db: Session,
@@ -333,23 +408,21 @@ def create_web_scraping_result(
     query_term: str,
     headline: str,
     link: str,
-    source_name: str = None
+    source_name: str = None,
+    article_date: datetime = None,
 ) -> models.WebScrapingResult:
-    """Create a new web scraping result (article)"""
-    # Check if link already exists to avoid duplicates
     existing = db.query(models.WebScrapingResult).filter(
         models.WebScrapingResult.link == link
     ).first()
-    
     if existing:
-        return existing  # Return existing record instead of creating duplicate
-    
+        return existing
     result = models.WebScrapingResult(
         business_id=business_id,
         query_term=query_term,
         headline=headline,
         link=link,
-        source_name=source_name
+        source_name=source_name,
+        article_date=article_date,
     )
     db.add(result)
     db.commit()
@@ -358,45 +431,445 @@ def create_web_scraping_result(
 
 
 def get_scraping_results_by_business(
-    db: Session,
-    business_id: int,
-    limit: int = 50
+    db: Session, business_id: int, limit: int = 50
 ) -> List[models.WebScrapingResult]:
-    """Get all web scraping results for a business"""
     return db.query(models.WebScrapingResult).filter(
         models.WebScrapingResult.business_id == business_id
     ).order_by(desc(models.WebScrapingResult.scraped_at)).limit(limit).all()
 
 
 def get_scraping_results_by_query(
-    db: Session,
-    query_term: str,
-    limit: int = 50
+    db: Session, query_term: str, limit: int = 50
 ) -> List[models.WebScrapingResult]:
-    """Get all web scraping results for a specific query term"""
     return db.query(models.WebScrapingResult).filter(
         models.WebScrapingResult.query_term == query_term
     ).order_by(desc(models.WebScrapingResult.scraped_at)).limit(limit).all()
 
 
-def get_latest_scraping_results(
-    db: Session,
-    limit: int = 100
-) -> List[models.WebScrapingResult]:
-    """Get most recent web scraping results across all businesses"""
+def get_latest_scraping_results(db: Session, limit: int = 100) -> List[models.WebScrapingResult]:
     return db.query(models.WebScrapingResult).order_by(
         desc(models.WebScrapingResult.scraped_at)
     ).limit(limit).all()
 
 
 def delete_old_scraping_results(db: Session, days: int = 30) -> int:
-    """Delete web scraping results older than specified days"""
     from datetime import timedelta
-    cutoff_date = datetime.now() - timedelta(days=days)
-    
+    cutoff = datetime.now() - timedelta(days=days)
     deleted = db.query(models.WebScrapingResult).filter(
-        models.WebScrapingResult.scraped_at < cutoff_date
+        models.WebScrapingResult.scraped_at < cutoff
     ).delete()
-    
     db.commit()
     return deleted
+
+
+# ─────────────────────────────────────────────────────────────────────
+# ZOMATO REVIEWS
+# ─────────────────────────────────────────────────────────────────────
+
+def create_zomato_review(
+    db: Session,
+    business_id: int,
+    review_text: str,
+    author_name: str = None,
+    rating: float = None,
+    raw_date: str = None,
+    review_date: datetime = None,
+    date_is_estimated: bool = False,
+    dining_type: str = "combined",
+    absa_results: dict = None,
+) -> models.ZomatoReview:
+    review = models.ZomatoReview(
+        business_id=business_id,
+        review_text=review_text,
+        author_name=author_name,
+        rating=rating,
+        raw_date=raw_date,
+        review_date=review_date,
+        date_is_estimated=date_is_estimated,
+        dining_type=dining_type,
+        absa_results=absa_results,
+    )
+    db.add(review)
+    db.commit()
+    db.refresh(review)
+    return review
+
+
+def bulk_create_zomato_reviews(
+    db: Session, business_id: int, reviews: List[Dict[str, Any]]
+) -> int:
+    """Insert many Zomato reviews. Returns count inserted."""
+    count = 0
+    for r in reviews:
+        try:
+            create_zomato_review(
+                db=db,
+                business_id=business_id,
+                review_text=r.get("review_text", ""),
+                author_name=r.get("author_name"),
+                rating=r.get("rating"),
+                raw_date=r.get("raw_date"),
+                review_date=r.get("review_date"),
+                date_is_estimated=r.get("date_is_estimated", False),
+                dining_type=r.get("dining_type", "combined"),
+                absa_results=r.get("absa_results"),
+            )
+            count += 1
+        except Exception:
+            db.rollback()
+    return count
+
+
+def get_zomato_reviews(
+    db: Session, business_id: int, limit: int = 500
+) -> List[models.ZomatoReview]:
+    return (
+        db.query(models.ZomatoReview)
+        .filter(models.ZomatoReview.business_id == business_id)
+        .order_by(desc(models.ZomatoReview.review_date))
+        .limit(limit)
+        .all()
+    )
+
+
+def delete_zomato_reviews(db: Session, business_id: int) -> int:
+    deleted = (
+        db.query(models.ZomatoReview)
+        .filter(models.ZomatoReview.business_id == business_id)
+        .delete()
+    )
+    db.commit()
+    return deleted
+
+
+# ─────────────────────────────────────────────────────────────────────
+# ZOMATO MENU ITEMS
+# ─────────────────────────────────────────────────────────────────────
+
+def upsert_menu_items(
+    db: Session, business_id: int, items: List[Dict[str, Any]]
+) -> int:
+    """Delete existing menu items and insert fresh ones. Returns count."""
+    db.query(models.ZomatoMenuItem).filter(
+        models.ZomatoMenuItem.business_id == business_id
+    ).delete()
+    db.commit()
+
+    count = 0
+    for item in items:
+        mi = models.ZomatoMenuItem(
+            business_id=business_id,
+            name=item.get("name", ""),
+            price=item.get("price"),
+            category=item.get("category"),
+            description=item.get("description"),
+            is_veg=item.get("is_veg"),
+            mention_count=item.get("mention_count", 0),
+            positive_mentions=item.get("positive_mentions", 0),
+            negative_mentions=item.get("negative_mentions", 0),
+            bcg_category=item.get("bcg_category"),
+        )
+        db.add(mi)
+        count += 1
+    db.commit()
+    return count
+
+
+def get_menu_items(db: Session, business_id: int) -> List[models.ZomatoMenuItem]:
+    return (
+        db.query(models.ZomatoMenuItem)
+        .filter(models.ZomatoMenuItem.business_id == business_id)
+        .all()
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────
+# INSTAGRAM MENTIONS
+# ─────────────────────────────────────────────────────────────────────
+
+def upsert_instagram_mention(
+    db: Session,
+    business_id: int,
+    post_id: str,
+    caption: str = None,
+    hashtags: list = None,
+    post_url: str = None,
+    image_url: str = None,
+    like_count: int = 0,
+    comment_count: int = 0,
+    posted_at: datetime = None,
+    date_available: bool = True,
+    absa_results: dict = None,
+) -> models.InstagramMention:
+    existing = (
+        db.query(models.InstagramMention)
+        .filter(
+            models.InstagramMention.business_id == business_id,
+            models.InstagramMention.post_id == post_id,
+        )
+        .first()
+    )
+    if existing:
+        existing.like_count    = like_count
+        existing.comment_count = comment_count
+        if absa_results:
+            existing.absa_results = absa_results
+        db.commit()
+        db.refresh(existing)
+        return existing
+
+    mention = models.InstagramMention(
+        business_id=business_id,
+        post_id=post_id,
+        caption=caption,
+        hashtags=hashtags,
+        post_url=post_url,
+        image_url=image_url,
+        like_count=like_count,
+        comment_count=comment_count,
+        posted_at=posted_at,
+        date_available=date_available,
+        absa_results=absa_results,
+    )
+    db.add(mention)
+    db.commit()
+    db.refresh(mention)
+    return mention
+
+
+def bulk_upsert_instagram_mentions(
+    db: Session, business_id: int, posts: List[Dict[str, Any]]
+) -> int:
+    count = 0
+    for p in posts:
+        try:
+            upsert_instagram_mention(
+                db=db,
+                business_id=business_id,
+                post_id=p.get("post_id", ""),
+                caption=p.get("caption"),
+                hashtags=p.get("hashtags"),
+                post_url=p.get("post_url"),
+                image_url=p.get("image_url"),
+                like_count=p.get("like_count", 0),
+                comment_count=p.get("comment_count", 0),
+                posted_at=p.get("posted_at"),
+                date_available=p.get("date_available", True),
+                absa_results=p.get("absa_results"),
+            )
+            count += 1
+        except Exception:
+            db.rollback()
+    return count
+
+
+def get_instagram_mentions(
+    db: Session, business_id: int, limit: int = 500
+) -> List[models.InstagramMention]:
+    return (
+        db.query(models.InstagramMention)
+        .filter(models.InstagramMention.business_id == business_id)
+        .order_by(desc(models.InstagramMention.posted_at))
+        .limit(limit)
+        .all()
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────
+# AGGREGATED ABSA
+# ─────────────────────────────────────────────────────────────────────
+
+def save_aggregated_absa(
+    db: Session,
+    business_id: int,
+    analysis_id: int,
+    aspect_confidence_list: List[Dict[str, Any]],
+    mece_clusters: List[Dict[str, Any]],
+    sentiment_variances: Dict[str, float],
+) -> List[models.AggregatedABSA]:
+    """
+    Save one AggregatedABSA row per aspect.
+    Clears existing rows for this business first.
+    mece_clusters is stored only on the first aspect row to avoid duplication.
+    """
+    db.query(models.AggregatedABSA).filter(
+        models.AggregatedABSA.business_id == business_id
+    ).delete()
+    db.commit()
+
+    rows = []
+    for idx, item in enumerate(aspect_confidence_list):
+        aspect = item["aspect"]
+        row = models.AggregatedABSA(
+            business_id=business_id,
+            analysis_id=analysis_id,
+            aspect=aspect,
+            overall_sentiment=item.get("overall_sentiment"),
+            confidence_score=item.get("confidence_score"),
+            source_breakdown=item.get("source_breakdown"),
+            conflict_flag=item.get("conflict_flag", False),
+            conflict_detail=item.get("conflict_detail"),
+            # Store MECE clusters only on first row to avoid bloat
+            mece_clusters=mece_clusters if idx == 0 else None,
+            sentiment_variance=sentiment_variances.get(aspect, 0.0),
+        )
+        db.add(row)
+        rows.append(row)
+
+    db.commit()
+    for r in rows:
+        db.refresh(r)
+    return rows
+
+
+def get_aggregated_absa(
+    db: Session, business_id: int
+) -> List[models.AggregatedABSA]:
+    return (
+        db.query(models.AggregatedABSA)
+        .filter(models.AggregatedABSA.business_id == business_id)
+        .order_by(desc(models.AggregatedABSA.confidence_score))
+        .all()
+    )
+
+
+def get_mece_clusters(db: Session, business_id: int) -> Optional[List[Dict[str, Any]]]:
+    """Retrieve MECE clusters stored on the first AggregatedABSA row."""
+    row = (
+        db.query(models.AggregatedABSA)
+        .filter(
+            models.AggregatedABSA.business_id == business_id,
+            models.AggregatedABSA.mece_clusters.isnot(None),
+        )
+        .first()
+    )
+    return row.mece_clusters if row else None
+
+
+# ─────────────────────────────────────────────────────────────────────
+# FRAMEWORK REPORTS
+# ─────────────────────────────────────────────────────────────────────
+
+def save_framework_reports(
+    db: Session,
+    business_id: int,
+    analysis_id: int,
+    frameworks: Dict[str, Any],
+    avg_confidence_per_framework: Dict[str, float],
+    sources_used: List[str],
+) -> List[models.FrameworkReport]:
+    """
+    Save one FrameworkReport row per framework (8 rows total).
+    Clears previous rows for this business first.
+    """
+    db.query(models.FrameworkReport).filter(
+        models.FrameworkReport.business_id == business_id
+    ).delete()
+    db.commit()
+
+    rows = []
+    for fw_name, fw_data in frameworks.items():
+        row = models.FrameworkReport(
+            business_id=business_id,
+            analysis_id=analysis_id,
+            framework=fw_name,
+            result_json=fw_data,
+            sources_used=sources_used,
+            avg_confidence=avg_confidence_per_framework.get(fw_name),
+        )
+        db.add(row)
+        rows.append(row)
+
+    db.commit()
+    for r in rows:
+        db.refresh(r)
+    return rows
+
+
+def get_framework_report(
+    db: Session, business_id: int, framework: str
+) -> Optional[models.FrameworkReport]:
+    return (
+        db.query(models.FrameworkReport)
+        .filter(
+            models.FrameworkReport.business_id == business_id,
+            models.FrameworkReport.framework == framework,
+        )
+        .order_by(desc(models.FrameworkReport.generated_at))
+        .first()
+    )
+
+
+def get_all_framework_reports(
+    db: Session, business_id: int
+) -> List[models.FrameworkReport]:
+    return (
+        db.query(models.FrameworkReport)
+        .filter(models.FrameworkReport.business_id == business_id)
+        .order_by(models.FrameworkReport.framework)
+        .all()
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────
+# ORM REVIEWS
+# ─────────────────────────────────────────────────────────────────────
+
+def save_orm_reviews(
+    db: Session, business_id: int, reviews: List[Dict[str, Any]]
+) -> int:
+    """
+    Save negative/conflict reviews for ORM display.
+    Clears previous ORM entries for this business first.
+    """
+    db.query(models.ORMReview).filter(
+        models.ORMReview.business_id == business_id
+    ).delete()
+    db.commit()
+
+    count = 0
+    for r in reviews:
+        row = models.ORMReview(
+            business_id=business_id,
+            source=r.get("source", "google_maps"),
+            review_text=r.get("review_text", ""),
+            author_name=r.get("author_name"),
+            rating=r.get("rating"),
+            review_date=r.get("review_date"),
+            aspect=r.get("aspect"),
+            sentiment=r.get("sentiment", "Negative"),
+            confidence=r.get("confidence"),
+            source_url=r.get("source_url"),
+            is_responded=False,
+        )
+        db.add(row)
+        count += 1
+    db.commit()
+    return count
+
+
+def get_orm_reviews(
+    db: Session,
+    business_id: int,
+    only_unresponded: bool = True,
+    limit: int = 100,
+) -> List[models.ORMReview]:
+    q = db.query(models.ORMReview).filter(
+        models.ORMReview.business_id == business_id
+    )
+    if only_unresponded:
+        q = q.filter(models.ORMReview.is_responded == False)  # noqa: E712
+    return q.order_by(desc(models.ORMReview.confidence)).limit(limit).all()
+
+
+def mark_orm_review_responded(
+    db: Session, orm_review_id: int
+) -> Optional[models.ORMReview]:
+    row = db.query(models.ORMReview).filter(
+        models.ORMReview.id == orm_review_id
+    ).first()
+    if row:
+        row.is_responded = True
+        db.commit()
+        db.refresh(row)
+    return row

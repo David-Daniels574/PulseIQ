@@ -14,6 +14,21 @@ import googlemaps
 from datetime import datetime
 from sqlalchemy.orm import Session
 from fastapi.middleware.cors import CORSMiddleware
+import nltk
+
+from collections import Counter
+from datetime import timedelta
+ 
+# New service imports
+from services.zomato_scraper import scrape_zomato
+from services.instagram_scraper import scrape_instagram
+from services.confidence_engine import (
+    compute_all_aspect_confidence,
+    compute_sentiment_variance,
+    cluster_complaints,
+)
+from services.framework_llm import generate_all_frameworks
+
 
 from analyzer import (
     analyze_review_for_aspects,
@@ -38,6 +53,9 @@ from services.scraper import scrape_google_news, scrape_multiple_queries
 
 # Import forecasting service
 from models.forecasting import generate_rating_forecast, get_forecast_summary
+from pydantic import BaseModel, ConfigDict
+from datetime import datetime
+from typing import Optional, List, Dict, Any
 
 # Load environment variables
 load_dotenv()
@@ -113,12 +131,15 @@ class CompetitorAnalysisRequest(BaseModel):
 
 
 class MarketIntelligenceRequest(BaseModel):
-    """Request model for market intelligence / web scraping"""
-    business_name: str = Field(..., description="Name of your business")
-    location: Optional[str] = Field("Mumbai", description="Location to filter news (default: Mumbai)")
-    include_competitors: Optional[bool] = Field(False, description="Also scrape competitor mentions")
-    competitor_names: Optional[List[str]] = Field(None, description="List of competitor names to track")
-
+    """Request for the Market Intelligence page (forecast + news)"""
+    business_name: str     = Field(..., description="Name of the restaurant")
+    city: str              = Field(..., description="City e.g. 'Mumbai'")
+    category: Optional[str] = Field("Restaurant", description="Business category for ML forecast")
+    current_rating: float  = Field(..., ge=1.0, le=5.0, description="Current average rating")
+    sentiment_score: Optional[float] = Field(None, ge=0.0, le=1.0,
+        description="Sentiment score 0-1. If omitted, derived from stored ABSA results.")
+    months_ahead: Optional[int] = Field(6, ge=1, le=12, description="Months to forecast (default 6)")
+    location: Optional[str]     = Field(None, description="Location string for news search (defaults to city)")
 
 class ForecastRequest(BaseModel):
     """Request model for star rating forecast"""
@@ -128,7 +149,62 @@ class ForecastRequest(BaseModel):
     current_rating: float = Field(..., ge=1.0, le=5.0, description="Current average rating (1.0-5.0)")
     sentiment_score: float = Field(..., ge=0.0, le=1.0, description="Sentiment score from ABSA (0.0-1.0)")
     months_ahead: Optional[int] = Field(6, ge=1, le=12, description="Number of months to forecast (default: 6)")
+    
+class OverviewRequest(BaseModel):
+    """Request for the Overview dashboard page"""
+    business_name: str = Field(..., description="Name of the restaurant")
+    area: str          = Field(..., description="Area/neighbourhood e.g. 'Colaba'")
+    city: str          = Field(..., description="City e.g. 'Mumbai'")
+    zomato_url: str    = Field(..., description="Full Zomato URL of the restaurant (user-provided)")
+    months_back: Optional[int] = Field(6, ge=1, le=24, description="How many months of data to include (default 6)")
+ 
+class CompetitorRequest(BaseModel):
+    """Request for the Competitor Analysis page"""
+    business_name: str = Field(..., description="Name of your restaurant")
+    area: str          = Field(..., description="Area/neighbourhood e.g. 'Colaba'")
+    city: str          = Field(..., description="City e.g. 'Mumbai'")
+    category: Optional[str] = Field("restaurant", description="Business category (default: restaurant)")
+    radius: Optional[int]   = Field(3000, description="Search radius in metres (default 3000)")
+ 
+class BusinessResponse(BaseModel):
+    id: int
+    place_id: str
+    name: str
+    category: Optional[str]
+    address: Optional[str]
+    location: Optional[str]
+    area: Optional[str]            # V2 Field
+    rating: Optional[float]
+    total_reviews: Optional[int]
+    
+    # V2 Zomato Fields
+    zomato_url: Optional[str]
+    zomato_rating: Optional[float]
+    zomato_reviews_count: Optional[int]
+    photo_count: Optional[int]
+    price_range: Optional[str]
+    cuisine_tags: Optional[List[str]]
 
+    model_config = ConfigDict(from_attributes=True) # orm_mode=True if using Pydantic v1
+
+class AggregatedABSAResponse(BaseModel):
+    aspect: str
+    overall_sentiment: Optional[str]
+    confidence_score: Optional[float]
+    source_breakdown: Optional[Dict[str, Any]]
+    conflict_flag: bool
+    conflict_detail: Optional[str]
+
+    model_config = ConfigDict(from_attributes=True)
+    
+class FrameworkReportResponse(BaseModel):
+    framework: str
+    result_json: Dict[str, Any]
+    sources_used: Optional[List[str]]
+    avg_confidence: Optional[float]
+
+    model_config = ConfigDict(from_attributes=True)
+ 
 
 # Startup event
 @app.on_event("startup")
@@ -193,7 +269,7 @@ async def root():
 @app.get("/debug/nltk")
 async def debug_nltk():
     """Test NLTK tokenization"""
-    import nltk
+    
     test_text = "The coffee was great. The staff were friendly."
     try:
         sentences = nltk.sent_tokenize(test_text)
@@ -246,289 +322,365 @@ async def debug_scraper(query: str = "Starbucks Mumbai"):
             "traceback": str(e.__traceback__)
         }
 
-# LLM Insights endpoint - Analyze business and generate strategic insights
 @app.post("/analyze/business/insights")
-async def analyze_business_with_insights(
-    request: BusinessRequest,
-    db: Session = Depends(get_db)
+async def analyze_business_overview(
+    request: OverviewRequest,
+    db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
     """
-    Fetch reviews from Google Maps, perform ABSA, and generate strategic insights using Gemini LLM
-    
-    This endpoint combines:
-    1. Google Maps review fetching
-    2. Review ingestion into ChromaDB (for RAG)
-    3. Aspect-based sentiment analysis
-    4. LLM-powered (RAG) strategic recommendations
-    5. Database storage of all results
-    
-    Args:
-        request: BusinessRequest containing business name, category, and location
-        db: Database session (injected)
-        
+    Overview page — aggregates Google Maps + Zomato + Instagram data,
+    runs ABSA on all sources, computes confidence scores, and returns
+    everything needed for the Overview dashboard.
+ 
     Returns:
-        Dictionary with ABSA results and strategic insights
+    - summary_stats: total_reviews, avg_rating, media_mentions, overall_confidence
+    - sentiment_breakdown: positive/neutral/negative percentages
+    - source_breakdown: review/mention counts per source
+    - review_volume_trend: monthly review counts (last N months)
+    - top_keywords: top-5 aspects by mention frequency
+    - aspect_sentiment: full ABSA breakdown per aspect with confidence scores
     """
     start_time = datetime.now()
-    
+    logger.info(f"🚀 STARTING INSIGHTS PIPELINE FOR: {request.business_name}")
     if not gmaps:
-        raise HTTPException(
-            status_code=503,
-            detail="Google Maps API is not configured. Please set GOOGLE_MAPS_API_KEY in .env file"
-        )
-    
+        raise HTTPException(status_code=503, detail="Google Maps API not configured")
+ 
     try:
-        # Set aspect keywords based on business category
-        set_aspect_keywords_for_category(request.category)
-        
-        # First, get the ABSA analysis (reuse existing logic)
-        # Construct search query
-        query = f"{request.business_name}"
-        if request.category:
-            query += f" {request.category}"
-        query += f" {request.location}"
-        
-        logger.info(f"Searching for business: {query}")
-        
-        # Search for the business
+        # ── Step 1: Resolve place via Google Maps ──────────────────
+        query = f"{request.business_name} {request.area} {request.city}"
         places_result = gmaps.places(query=query)
-        
-        if not places_result.get('results'):
-            raise HTTPException(
-                status_code=404,
-                detail=f"No business found matching: {query}"
-            )
-        
-        # Get the first (most relevant) result
-        place = places_result['results'][0]
-        place_id = place['place_id']
-        place_name = place['name']
-        place_address = place.get('formatted_address', 'N/A')
-        
-        logger.info(f"Found business: {place_name} (ID: {place_id})")
-        
-        # Get detailed place information including reviews
-        place_details = gmaps.place(place_id=place_id, fields=['name', 'rating', 'user_ratings_total', 'reviews'])
-        
-        if 'result' not in place_details:
-            raise HTTPException(
-                status_code=404,
-                detail="Unable to fetch business details"
-            )
-        
-        result = place_details['result']
-        reviews_data = result.get('reviews', [])
-        
-        if not reviews_data:
-            return {
-                "status": "success",
-                "business_info": {
-                    "name": place_name,
-                    "address": place_address,
-                    "rating": result.get('rating', 'N/A'),
-                    "total_ratings": result.get('user_ratings_total', 0)
-                },
-                "message": "No reviews found for this business",
-                "analysis": {},
-                "insights": None
-            }
-        
-        logger.info(f"Found {len(reviews_data)} reviews for {place_name}")
-        
-        # Extract review texts
-        review_texts = [review['text'] for review in reviews_data if review.get('text')]
-        
-        if not review_texts:
-            return {
-                "status": "success",
-                "business_info": {
-                    "name": place_name,
-                    "address": place_address,
-                    "rating": result.get('rating', 'N/A'),
-                    "total_ratings": result.get('user_ratings_total', 0)
-                },
-                "message": "No review texts available for analysis",
-                "analysis": {},
-                "insights": None
-            }
-        
-        # ### --- NEW RAG STEP: INGEST REVIEWS --- ###
-        # Ingest (embed and store) these reviews into ChromaDB
-        # This function is fast and uses 'upsert' to avoid duplicates.
-        logger.info(f"Ingesting/updating {len(review_texts)} reviews for {place_name} in vector store...")
-        ingest_reviews_to_chroma(
-            business_name=place_name,
-            review_texts=review_texts
+        if not places_result.get("results"):
+            raise HTTPException(status_code=404, detail=f"No business found: {query}")
+ 
+        place        = places_result["results"][0]
+        place_id     = place["place_id"]
+        place_name   = place["name"]
+        place_addr   = place.get("formatted_address", "")
+ 
+        details = gmaps.place(
+            place_id=place_id,
+            fields=["name", "rating", "user_ratings_total", "reviews"],
         )
-        # ### --- END OF NEW STEP --- ###
+        result_data   = details["result"]
+        gmap_reviews  = result_data.get("reviews", [])
+        gmap_rating   = result_data.get("rating", 0)
+        gmap_total    = result_data.get("user_ratings_total", 0)
+        logger.info(f"⏱️ Step 1 (Google Maps API)")
+ 
+        # ── Step 2: DB upsert for Business ─────────────────────────
+        business_db = crud.get_or_create_business(
+            db=db,
+            place_id=place_id,
+            name=place_name,
+            category="restaurant",
+            address=place_addr,
+            location=request.city,
+            latitude=place.get("geometry", {}).get("location", {}).get("lat"),
+            longitude=place.get("geometry", {}).get("location", {}).get("lng"),
+            rating=gmap_rating,
+            total_reviews=gmap_total,
+        )
+        crud.upsert_business_zomato_info(
+            db=db,
+            place_id=place_id,
+            zomato_url=request.zomato_url,
+            area=request.area,
+        )
+        logger.info(f"⏱️ Step 2 (DB Upsert Business)")
+ 
+        # ── Step 3: Date cutoff ────────────────────────────────────
+        cutoff_dt = datetime.utcnow() - timedelta(days=request.months_back * 30)
+ 
+        # ── Step 4: Google Maps ABSA ───────────────────────────────
+        set_aspect_keywords_for_category("restaurant")
+ 
+        gmap_texts = [r["text"] for r in gmap_reviews if r.get("text")]
+        gmap_absa  = analyze_multiple_reviews(gmap_texts) if gmap_texts else {}
+ 
+        # Store reviews
+        for r in gmap_reviews:
+            if r.get("text"):
+                crud.create_review(
+                    db=db,
+                    business_id=business_db.id,
+                    review_text=r["text"],
+                    author_name=r.get("author_name"),
+                    rating=r.get("rating"),
+                    review_date=(
+                        datetime.fromtimestamp(r["time"]) if r.get("time") else None
+                    ),
+                    source="google_maps",
+                )
+        logger.info(f"⏱️ Step 4 (Google Maps ABSA + Store Reviews)")
+ 
+        # ── Step 5: Zomato scrape + ABSA ──────────────────────────
+        zomato_data   = scrape_zomato(request.zomato_url, months_back=request.months_back)
+        zomato_reviews = zomato_data.get("reviews", [])
+        zomato_info    = zomato_data.get("restaurant_info", {})
+        menu_items     = zomato_data.get("menu_items", [])
+ 
+        crud.upsert_business_zomato_info(
+            db=db,
+            place_id=place_id,
+            zomato_rating=zomato_info.get("rating"),
+            zomato_reviews_count=zomato_info.get("review_count"),
+            photo_count=zomato_info.get("photo_count"),
+            price_range=zomato_info.get("price_range"),
+            cuisine_tags=zomato_info.get("cuisine_tags"),
+        )
+        crud.upsert_menu_items(db=db, business_id=business_db.id, items=menu_items)
+ 
+        zomato_texts = [r["review_text"] for r in zomato_reviews if r.get("review_text")]
+        zomato_absa  = analyze_multiple_reviews(zomato_texts) if zomato_texts else {}
+        crud.bulk_create_zomato_reviews(db=db, business_id=business_db.id, reviews=zomato_reviews)
         
-        # Analyze all reviews
-        logger.info(f"Analyzing {len(review_texts)} reviews...")
-        analysis_results = analyze_multiple_reviews(review_texts)
+        logger.info(f"⏱️ Step 5 (Zomato Scrape + ABSA + Store Reviews)")
+ 
+        # ── Step 6: Instagram scrape + ABSA ───────────────────────
+        insta_data   = scrape_instagram(
+            restaurant_name=request.business_name,
+            area=request.area,
+            city=request.city,
+            months_back=request.months_back,
+        )
+        insta_posts    = insta_data.get("posts", [])
+        virality_index = insta_data.get("virality_index", {})
+ 
+        insta_captions = [p["caption"] for p in insta_posts if p.get("caption")]
+        insta_absa     = analyze_multiple_reviews(insta_captions) if insta_captions else {}
+        crud.bulk_upsert_instagram_mentions(db=db, business_id=business_db.id, posts=insta_posts)
         
-        # Prepare business info
-        business_info = {
-            "name": place_name,
-            "address": place_address,
-            "rating": result.get('rating', 'N/A'),
-            "total_ratings": result.get('user_ratings_total', 0),
-            "reviews_analyzed": len(review_texts)
+        logger.info(f"⏱️ Step 6 (Instagram Scrape + ABSA + Store Mentions)")
+ 
+        # ── Step 7: News mentions ──────────────────────────────────
+        news_articles = scrape_google_news(
+            query_term=request.business_name,
+            location=request.city,
+            max_results=20,
+        )
+        for article in news_articles:
+            crud.create_web_scraping_result(
+                db=db,
+                business_id=business_db.id,
+                query_term=request.business_name,
+                headline=article["headline"],
+                link=article["link"],
+                source_name=article["source_name"],
+            )
+        logger.info(f"⏱️ Step 7 (Google News Scrape + Store Results)")
+ 
+        # ── Step 8: Confidence engine ──────────────────────────────
+        aggregated = compute_all_aspect_confidence(
+            gmap_absa=gmap_absa,
+            zomato_absa=zomato_absa,
+            insta_absa=insta_absa,
+            months_back=request.months_back,
+        )
+        variances = compute_sentiment_variance(aggregated)
+ 
+        # Collect negative sentences for MECE clustering
+        negative_sentences = []
+        for src_name, src_absa in [
+            ("google_maps", gmap_absa),
+            ("zomato", zomato_absa),
+            ("instagram", insta_absa),
+        ]:
+            for aspect, data in src_absa.items():
+                if isinstance(data, dict):
+                    for detail in data.get("details", []):
+                        if detail.get("sentiment") == "Negative":
+                            negative_sentences.append({
+                                "sentence":   detail.get("sentence", ""),
+                                "aspect":     aspect,
+                                "source":     src_name,
+                                "confidence": detail.get("score", 0.0),
+                            })
+        mece_clusters = cluster_complaints(negative_sentences)
+        
+        logger.info(f"⏱️ Step 8 (Confidence Engine + MECE Clustering)")
+ 
+        # ── Step 9: Store aggregated ABSA ─────────────────────────
+        analysis_db = crud.create_analysis(
+            db=db,
+            business_id=business_db.id,
+            analysis_type="absa_full",
+            total_reviews_analyzed=len(gmap_texts) + len(zomato_texts) + len(insta_captions),
+            aspect_results={
+                "google_maps": gmap_absa,
+                "zomato":      zomato_absa,
+                "instagram":   insta_absa,
+            },
+            months_back=request.months_back,
+            sources_used={
+                "google_maps": len(gmap_texts),
+                "zomato":      len(zomato_texts),
+                "instagram":   len(insta_captions),
+                "news":        len(news_articles),
+            },
+        )
+        crud.save_aggregated_absa(
+            db=db,
+            business_id=business_db.id,
+            analysis_id=analysis_db.id,
+            aspect_confidence_list=aggregated,
+            mece_clusters=mece_clusters,
+            sentiment_variances=variances,
+        )
+        
+        logger.info(f"⏱️ Step 9 (Store Aggregated ABSA Results)")
+ 
+        # ── Step 10: Build response payload ───────────────────────
+ 
+        # Overall sentiment across all sources
+        all_sentiments = [a["overall_sentiment"] for a in aggregated]
+        sentiment_counts = Counter(all_sentiments)
+        total_aspects    = len(all_sentiments) or 1
+        sentiment_breakdown = {
+            "positive": round(sentiment_counts.get("Positive", 0) / total_aspects * 100, 1),
+            "neutral":  round(sentiment_counts.get("Neutral",  0) / total_aspects * 100, 1),
+            "negative": round(sentiment_counts.get("Negative", 0) / total_aspects * 100, 1),
+        }
+ 
+        # Overall confidence = average across all aspects
+        overall_confidence = round(
+            sum(a["confidence_score"] for a in aggregated) / (len(aggregated) or 1), 1
+        )
+ 
+        # Average rating across sources
+        ratings = [r for r in [gmap_rating, zomato_info.get("rating")] if r]
+        avg_rating = round(sum(ratings) / len(ratings), 2) if ratings else gmap_rating
+ 
+        # Source breakdown
+        source_breakdown = {
+            "google_maps": {
+                "review_count": len(gmap_texts),
+                "avg_rating":   gmap_rating,
+                "total_on_platform": gmap_total,
+            },
+            "zomato": {
+                "review_count": len(zomato_texts),
+                "avg_rating":   zomato_info.get("rating"),
+                "photo_count":  zomato_info.get("photo_count", 0),
+                "price_range":  zomato_info.get("price_range"),
+                "cuisine_tags": zomato_info.get("cuisine_tags", []),
+            },
+            "instagram": {
+                "post_count":       virality_index.get("total_posts", 0),
+                "total_likes":      virality_index.get("total_likes", 0),
+                "total_comments":   virality_index.get("total_comments", 0),
+                "virality_score":   virality_index.get("virality_score", 0),
+                "virality_level":   virality_index.get("level", "Low"),
+            },
+            "news": {
+                "article_count": len(news_articles),
+            },
         }
         
-        # ### --- MODIFIED INSIGHTS CALL --- ###
-        # Generate strategic insights using Gemini LLM (now with RAG)
-        logger.info(f"Generating strategic insights using Gemini LLM with RAG...")
-        
-        # We no longer pass 'raw_reviews'. The function will
-        # automatically retrieve the best context from ChromaDB.
-        insights = generate_business_insights(
+        logger.info(f"⏱️ Step 10 (Build Response Payload)")
+ 
+        # Review Volume Trend — monthly count across Google Maps + Zomato
+        # Build a dict {YYYY-MM: count}
+        month_buckets: Dict[str, int] = {}
+        for r in gmap_reviews:
+            if r.get("time"):
+                dt = datetime.fromtimestamp(r["time"])
+                key = dt.strftime("%Y-%m")
+                month_buckets[key] = month_buckets.get(key, 0) + 1
+        for r in zomato_reviews:
+            if r.get("review_date") and not r.get("date_is_estimated"):
+                key = r["review_date"].strftime("%Y-%m")
+                month_buckets[key] = month_buckets.get(key, 0) + 1
+ 
+        # Keep only last N months, sorted
+        sorted_months = sorted(month_buckets.keys())
+        review_volume_trend = [
+            {"month": m, "count": month_buckets[m]}
+            for m in sorted_months
+        ]
+ 
+        # Top-5 aspects by mention count (across all sources)
+        aspect_mention_counts: Dict[str, int] = {}
+        for src_absa in [gmap_absa, zomato_absa, insta_absa]:
+            for aspect, data in src_absa.items():
+                if isinstance(data, dict):
+                    aspect_mention_counts[aspect] = (
+                        aspect_mention_counts.get(aspect, 0) + data.get("total_mentions", 0)
+                    )
+        top_keywords = sorted(
+            [{"keyword": k, "count": v} for k, v in aspect_mention_counts.items()],
+            key=lambda x: x["count"],
+            reverse=True,
+        )[:5]
+ 
+        # Full aspect-sentiment breakdown with confidence
+        aspect_sentiment = [
+            {
+                "aspect":            a["aspect"],
+                "overall_sentiment": a["overall_sentiment"],
+                "confidence_score":  a["confidence_score"],
+                "conflict":          a["conflict_flag"],
+                "conflict_detail":   a.get("conflict_detail"),
+                "source_breakdown":  a.get("source_breakdown", {}),
+                "mention_count":     aspect_mention_counts.get(a["aspect"], 0),
+            }
+            for a in aggregated
+        ]
+ 
+        # Log
+        execution_time = int((datetime.now() - start_time).total_seconds() * 1000)
+        crud.log_analysis(
+            db=db,
             business_name=place_name,
-            business_info=business_info,
-            absa_results=analysis_results
+            category="restaurant",
+            location=request.city,
+            endpoint="/analyze/business/insights",
+            status="success",
+            execution_time_ms=execution_time,
         )
-        # ### --- END OF MODIFIED CALL --- ###
-        
-        # ### --- DATABASE STORAGE --- ###
-        logger.info("Storing results in database...")
-        try:
-            # 1. Create or get business record
-            business_db = crud.get_or_create_business(
-                db=db,
-                place_id=place_id,
-                name=place_name,
-                category=request.category,
-                address=place_address,
-                location=request.location,
-                latitude=place.get('geometry', {}).get('location', {}).get('lat'),
-                longitude=place.get('geometry', {}).get('location', {}).get('lng'),
-                rating=result.get('rating'),
-                total_reviews=result.get('user_ratings_total', 0)
-            )
-            
-            # 2. Store all reviews
-            review_db_ids = []
-            for review_data in reviews_data:
-                if review_data.get('text'):
-                    review_db = crud.create_review(
-                        db=db,
-                        business_id=business_db.id,
-                        review_text=review_data['text'],
-                        author_name=review_data.get('author_name'),
-                        rating=review_data.get('rating'),
-                        review_date=datetime.fromtimestamp(review_data.get('time', 0)) if review_data.get('time') else None,
-                        source="google_maps"
-                    )
-                    review_db_ids.append(review_db.id)
-            
-            # 3. Store ABSA analysis results
-            analysis_db = crud.create_analysis(
-                db=db,
-                business_id=business_db.id,
-                analysis_type="absa_with_insights",
-                total_reviews_analyzed=len(review_texts),
-                aspect_results=analysis_results,
-                overall_sentiment=analysis_results.get('overall_sentiment', {}).get('sentiment', 'neutral'),
-                average_rating=result.get('rating')
-            )
-            
-            # 4. Store review sentiments (aspect-level)
-            for aspect, data in analysis_results.get('aspect_analysis', {}).items():
-                sentiment_counts = data.get('sentiment_distribution', {})
-                # Store dominant sentiment for this aspect
-                dominant_sentiment = max(sentiment_counts.items(), key=lambda x: x[1])[0] if sentiment_counts else 'neutral'
-                confidence = sentiment_counts.get(dominant_sentiment, 0) / sum(sentiment_counts.values()) if sum(sentiment_counts.values()) > 0 else 0
-                
-                # Create a sentiment record for each review that mentioned this aspect
-                for review_id in review_db_ids[:len(data.get('mentions', []))]:  # Match reviews to mentions
-                    crud.create_review_sentiment(
-                        db=db,
-                        review_id=review_id,
-                        aspect=aspect,
-                        sentiment=dominant_sentiment,
-                        confidence_score=confidence,
-                        sentence=None  # Could be extracted if needed
-                    )
-            
-            # 5. Store LLM insights
-            insights_db = crud.create_insight_report(
-                db=db,
-                business_id=business_db.id,
-                executive_summary=insights.get('executive_summary'),
-                marketing_recommendations=insights.get('marketing_recommendations', []),
-                pr_recommendations=insights.get('pr_recommendations', []),
-                operational_improvements=insights.get('operational_improvements', []),
-                competitive_positioning=insights.get('competitive_positioning', []),
-                priority_actions=insights.get('priority_actions', []),
-                rag_enabled=True,
-                reviews_retrieved=len(review_texts),
-                full_insights_text=str(insights)
-            )
-            
-            # 6. Log the analysis in history
-            execution_time = int((datetime.now() - start_time).total_seconds() * 1000)
-            crud.log_analysis(
-                db=db,
-                business_name=place_name,
-                category=request.category,
-                location=request.location,
-                endpoint="/analyze/business/insights",
-                status="success",
-                execution_time_ms=execution_time
-            )
-            
-            logger.info(f"✅ Results stored in database (Business ID: {business_db.id})")
-            
-        except Exception as db_error:
-            logger.error(f"Database storage error (non-fatal): {db_error}")
-            # Don't fail the request if DB storage fails
-        # ### --- END DATABASE STORAGE --- ###
-        
+ 
         return {
             "status": "success",
-            "business_info": business_info,
-            "analysis": analysis_results,
-            "strategic_insights": insights,
-            "quick_summary": generate_quick_summary(analysis_results)
+            "business_info": {
+                "name":          place_name,
+                "area":          request.area,
+                "city":          request.city,
+                "address":       place_addr,
+                "place_id":      place_id,
+                "zomato_url":    request.zomato_url,
+                "cuisine_tags":  zomato_info.get("cuisine_tags", []),
+                "price_range":   zomato_info.get("price_range"),
+                "months_back":   request.months_back,
+            },
+            "summary_stats": {
+                "total_reviews":      len(gmap_texts) + len(zomato_texts),
+                "avg_rating":         avg_rating,
+                "media_mentions":     len(news_articles),
+                "instagram_posts":    virality_index.get("total_posts", 0),
+                "overall_confidence": overall_confidence,
+            },
+            "sentiment_breakdown":  sentiment_breakdown,
+            "source_breakdown":     source_breakdown,
+            "review_volume_trend":  review_volume_trend,
+            "top_keywords":         top_keywords,
+            "aspect_sentiment":     aspect_sentiment,
+            "execution_time_ms":    execution_time,
         }
-        
-    except googlemaps.exceptions.ApiError as e:
-        logger.error(f"Google Maps API error: {e}")
-        # Log failed analysis
-        try:
-            execution_time = int((datetime.now() - start_time).total_seconds() * 1000)
-            crud.log_analysis(
-                db=db,
-                business_name=request.business_name,
-                category=request.category,
-                location=request.location,
-                endpoint="/analyze/business/insights",
-                status="failed",
-                error_message=f"Google Maps API error: {str(e)}",
-                execution_time_ms=execution_time
-            )
-        except:
-            pass
-        raise HTTPException(status_code=502, detail=f"Google Maps API error: {str(e)}")
+ 
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error analyzing business with insights: {e}")
-        # Log failed analysis
+        logger.error(f"Overview endpoint error: {e}")
+        execution_time = int((datetime.now() - start_time).total_seconds() * 1000)
         try:
-            execution_time = int((datetime.now() - start_time).total_seconds() * 1000)
             crud.log_analysis(
-                db=db,
-                business_name=request.business_name,
-                category=request.category,
-                location=request.location,
-                endpoint="/analyze/business/insights",
-                status="failed",
-                error_message=str(e),
-                execution_time_ms=execution_time
+                db=db, business_name=request.business_name,
+                category="restaurant", location=request.city,
+                endpoint="/analyze/business/insights", status="failed",
+                error_message=str(e), execution_time_ms=execution_time,
             )
-        except:
+        except Exception:
             pass
-        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 # Generate review response template
 @app.post("/insights/response-template")
@@ -564,525 +716,433 @@ async def create_response_template(request: ResponseTemplateRequest) -> Dict[str
         raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
 
 
-# Competitor Analysis endpoint - Optimized with Database
+# ───────────────────────────────────────────────────────────────────
+# 4.  REPLACE  /analyze/competitors  (Competitor Analysis page)
+# ───────────────────────────────────────────────────────────────────
+ 
 @app.post("/analyze/competitors")
 async def analyze_competitors(
-    request: CompetitorAnalysisRequest,
-    db: Session = Depends(get_db)
+    request: CompetitorRequest,
+    db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
     """
-    Fetch and analyze top 4 competitors using stored business data
-    
-    This optimized endpoint:
-    1. Retrieves main business data from DATABASE (no redundant API call)
-    2. Searches for competitors nearby using Google Maps
-    3. Stores competitor data in PostgreSQL
-    4. Returns comprehensive competitive analysis
-    
-    Args:
-        request: CompetitorAnalysisRequest with business name, category, and location
-        db: Database session (injected)
-        
+    Competitor Analysis page.
+ 
     Returns:
-        Dictionary with competitor comparison data stored in DB
+    - main_business: name, rating, total_reviews
+    - market_position: Leader / Challenger / Follower
+    - avg_competitor_rating, avg_competitor_reviews, rating_vs_avg
+    - competitors: list of top-5 with name/rating/reviews/status/category/position
+    - rating_vs_reviews_chart: [{name, rating, reviews}] for scatter graph
+    - aspect_showdown: your scores vs competitor avg for Food/Service/Ambiance/Price/Location
     """
     start_time = datetime.now()
-    
+ 
     if not gmaps:
-        raise HTTPException(
-            status_code=503,
-            detail="Google Maps API is not configured. Please set GOOGLE_MAPS_API_KEY in .env file"
-        )
-    
+        raise HTTPException(status_code=503, detail="Google Maps API not configured")
+ 
     try:
-        # Step 1: Get main business from DATABASE (optimized - no API call)
-        logger.info(f"Retrieving main business from database: {request.business_name}")
-        
-        # Try to find business in database first
-        main_business_db = crud.get_business_by_name(db, request.business_name, request.location)
-        
-        if not main_business_db:
-            # If not in database, we need to fetch it once from Google Maps
-            logger.info(f"Business not in database, fetching from Google Maps: {request.business_name}")
-            main_query = f"{request.business_name}"
-            if request.category:
-                main_query += f" {request.category}"
-            main_query += f" {request.location}"
-            
-            main_business_result = gmaps.places(query=main_query)
-            
-            if not main_business_result.get('results'):
-                raise HTTPException(
-                    status_code=404,
-                    detail=f"Could not find your business: {request.business_name}"
-                )
-            
-            # Get main business details
-            main_business = main_business_result['results'][0]
-            place_id = main_business['place_id']
-            place_name = main_business['name']
-            place_address = main_business.get('formatted_address', 'N/A')
-            main_business_location = main_business.get('geometry', {}).get('location', {})
-            
-            # Get detailed info
-            main_details = gmaps.place(
-                place_id=place_id, 
-                fields=['name', 'rating', 'user_ratings_total', 'formatted_address', 'place_id']
-            )
-            
-            # Store in database for future use
-            main_business_db = crud.get_or_create_business(
+        # ── Resolve main business ──────────────────────────────────
+        main_db = crud.get_business_by_name(db, request.business_name, request.city)
+ 
+        if not main_db:
+            query = f"{request.business_name} {request.area} {request.city}"
+            places = gmaps.places(query=query)
+            if not places.get("results"):
+                raise HTTPException(status_code=404, detail=f"Business not found: {query}")
+            place = places["results"][0]
+            det   = gmaps.place(
+                place_id=place["place_id"],
+                fields=["name", "rating", "user_ratings_total", "formatted_address"],
+            )["result"]
+            main_db = crud.get_or_create_business(
                 db=db,
-                place_id=place_id,
-                name=place_name,
+                place_id=place["place_id"],
+                name=place["name"],
                 category=request.category,
-                address=place_address,
-                location=request.location,
-                latitude=main_business_location.get('lat'),
-                longitude=main_business_location.get('lng'),
-                rating=main_details['result'].get('rating'),
-                total_reviews=main_details['result'].get('user_ratings_total', 0)
+                address=det.get("formatted_address", ""),
+                location=request.city,
+                latitude=place.get("geometry", {}).get("location", {}).get("lat"),
+                longitude=place.get("geometry", {}).get("location", {}).get("lng"),
+                rating=det.get("rating"),
+                total_reviews=det.get("user_ratings_total", 0),
             )
-            
-            logger.info(f"✅ Main business stored in database (ID: {main_business_db.id})")
-        
-        # Prepare main business info from database
-        main_info = {
-            "name": main_business_db.name,
-            "place_id": main_business_db.place_id,
-            "rating": float(main_business_db.rating) if main_business_db.rating else 0,
-            "total_reviews": main_business_db.total_reviews or 0,
-            "address": main_business_db.address
-        }
-        
-        logger.info(f"Main business loaded: {main_info['name']} (Rating: {main_info['rating']}, Reviews: {main_info['total_reviews']})")
-        
-        # Step 2: Search for competitors nearby (only competitor query, not main business)
-        if not main_business_db.latitude or not main_business_db.longitude:
-            raise HTTPException(
-                status_code=500,
-                detail="Business location coordinates not available in database"
-            )
-        
-        lat = main_business_db.latitude
-        lng = main_business_db.longitude
-        
-        logger.info(f"Searching for competitors near ({lat}, {lng}) within {request.radius}m")
-        
-        # Use nearby search to find similar businesses
-        competitors_result = gmaps.places_nearby(
-            location=(lat, lng),
+ 
+        if not main_db.latitude or not main_db.longitude:
+            raise HTTPException(status_code=400, detail="Main business has no coordinates. Run /analyze/business/insights first.")
+ 
+        your_rating  = float(main_db.rating or 0)
+        your_reviews = int(main_db.total_reviews or 0)
+ 
+        # ── Find nearby competitors ────────────────────────────────
+        nearby = gmaps.places_nearby(
+            location=(main_db.latitude, main_db.longitude),
             radius=request.radius,
-            type=request.category.lower() if request.category else None,
-            keyword=request.category if request.category else None
+            keyword=request.category,
         )
-        
-        if not competitors_result.get('results'):
-            return {
-                "status": "success",
-                "main_business": main_info,
-                "competitors": [],
-                "message": "No competitors found in the specified area",
-                "total_competitors_found": 0
-            }
-        
-        # Step 3: Filter, rank, and STORE competitors
-        competitors = []
-        
-        for place in competitors_result['results']:
-            # Skip if it's the main business
-            if place['place_id'] == main_business_db.place_id:
-                logger.info(f"Skipping main business: {place['name']}")
-                continue
-            
-            # Skip if no rating (likely closed or not enough data)
-            if 'rating' not in place:
-                continue
-            
-            competitor_location = place.get('geometry', {}).get('location', {})
-            
-            # Store competitor in database
-            competitor_db = crud.get_or_create_business(
-                db=db,
-                place_id=place['place_id'],
-                name=place.get('name', 'Unknown'),
-                category=request.category,
-                address=place.get('vicinity', 'N/A'),
-                location=request.location,
-                latitude=competitor_location.get('lat'),
-                longitude=competitor_location.get('lng'),
-                rating=place.get('rating'),
-                total_reviews=place.get('user_ratings_total', 0)
-            )
-            
-            competitor_data = {
-                "name": competitor_db.name,
-                "place_id": competitor_db.place_id,
-                "rating": float(competitor_db.rating) if competitor_db.rating else 0,
-                "total_reviews": competitor_db.total_reviews or 0,
-                "address": competitor_db.address,
-                "is_open": place.get('opening_hours', {}).get('open_now', None),
-                "db_id": competitor_db.id
-            }
-            
-            competitors.append(competitor_data)
-        
-        # Step 4: Sort by rating (primary) and review count (secondary)
-        competitors_sorted = sorted(
-            competitors,
-            key=lambda x: (x['rating'], x['total_reviews']),
-            reverse=True
+        raw_competitors = [
+            p for p in nearby.get("results", [])
+            if p["place_id"] != main_db.place_id and p.get("rating")
+        ]
+        raw_competitors.sort(
+            key=lambda p: (p.get("rating", 0), p.get("user_ratings_total", 0)),
+            reverse=True,
         )
-        
-        # Step 5: Get top 4 competitors
-        top_4_competitors = competitors_sorted[:4]
-        
-        logger.info(f"Found {len(competitors)} competitors, proceeding with ABSA for top 4 and storing results")
-
-        # Helper to compute 1-5 aspect scores from sentiment breakdown
-        def compute_aspect_scores(aspect_results: Dict[str, Any]) -> Dict[str, float]:
+        top5 = raw_competitors[:5]
+ 
+        # ── Fetch/store competitor details + ABSA ─────────────────
+        set_aspect_keywords_for_category(request.category)
+ 
+        target_aspects = ["Food/Product", "Service", "Ambiance", "Price"]
+        # "Location" is inferred from rating since Google Maps reviews often mention it
+ 
+        def compute_aspect_scores_1_5(absa: Dict[str, Any]) -> Dict[str, float]:
             scores: Dict[str, float] = {}
-            for aspect, a in aspect_results.items():
-                try:
-                    pos = a.get('sentiment_breakdown', {}).get('Positive', 0)
-                    neg = a.get('sentiment_breakdown', {}).get('Negative', 0)
-                    neu = a.get('sentiment_breakdown', {}).get('Neutral', 0)
-                    total = pos + neg + neu
-                    if total == 0:
-                        continue
-                    # Weighted score: Positive=1, Neutral=0.5, Negative=0 -> scale to 1..5
-                    frac = (pos + 0.5 * neu) / total
-                    score_1_5 = round(1 + 4 * frac, 2)
-                    scores[aspect] = score_1_5
-                except Exception:
+            for asp, data in absa.items():
+                if not isinstance(data, dict):
                     continue
+                bd = data.get("sentiment_breakdown", {})
+                pos, neg, neu = bd.get("Positive", 0), bd.get("Negative", 0), bd.get("Neutral", 0)
+                total = pos + neg + neu
+                if total == 0:
+                    continue
+                scores[asp] = round(1 + 4 * (pos + 0.5 * neu) / total, 2)
             return scores
-
-        # Step 6: Load ABSA for main business from DB (do NOT re-analyze)
-        main_analysis = crud.get_latest_analysis(db, main_business_db.id, analysis_type="absa_with_insights") or \
-                         crud.get_latest_analysis(db, main_business_db.id, analysis_type="absa")
-        if not main_analysis or not main_analysis.aspect_results:
-            raise HTTPException(
-                status_code=404,
-                detail="No stored ABSA found for the main business. Please run /analyze/business/insights first."
-            )
-
-        main_aspect_scores = compute_aspect_scores(main_analysis.aspect_results)
-
-        # Step 7: For each competitor, fetch reviews -> run ABSA -> store -> compute aspect scores
-        stored_competitors = []
+ 
+        competitors_out = []
         competitor_aspect_scores: Dict[str, Dict[str, float]] = {}
-        your_rating = main_info['rating']
-        your_reviews = main_info['total_reviews']
-        
-        for rank, competitor in enumerate(top_4_competitors, start=1):
-            # Store competitor meta row in competitor_analyses table
-            try:
-                competitor_analysis_db = crud.create_competitor_analysis(
-                    db=db,
-                    main_business_id=main_business_db.id,
-                    competitor_place_id=competitor['place_id'],
-                    competitor_name=competitor['name'],
-                    competitor_rating=competitor['rating'],
-                    competitor_reviews=competitor['total_reviews'],
-                    competitor_address=competitor['address'],
-                    rank=rank,
-                    rating_difference=round(your_rating - competitor['rating'], 2),
-                    review_difference=your_reviews - competitor['total_reviews'],
-                    search_radius=request.radius,
-                    search_category=request.category
-                )
-                stored_competitors.append(competitor_analysis_db.id)
-            except Exception as e:
-                logger.warning(f"Failed to store competitor row (meta): {e}")
-
-            # Fetch competitor reviews
-            comp_details = gmaps.place(
-                place_id=competitor['place_id'],
-                fields=['name', 'rating', 'user_ratings_total', 'reviews']
+ 
+        for rank, place in enumerate(top5, start=1):
+            comp_db = crud.get_or_create_business(
+                db=db,
+                place_id=place["place_id"],
+                name=place.get("name", ""),
+                category=request.category,
+                address=place.get("vicinity", ""),
+                location=request.city,
+                latitude=place.get("geometry", {}).get("location", {}).get("lat"),
+                longitude=place.get("geometry", {}).get("location", {}).get("lng"),
+                rating=place.get("rating"),
+                total_reviews=place.get("user_ratings_total", 0),
             )
-            comp_reviews_data = comp_details.get('result', {}).get('reviews', []) if comp_details else []
-            comp_texts = [r['text'] for r in comp_reviews_data if r.get('text')]
-            
-            if not comp_texts:
-                logger.info(f"No review texts available for competitor: {competitor['name']}")
-                competitor_aspect_scores[competitor['name']] = {}
-                continue
-            
-            # Run ABSA for competitor
-            comp_analysis_results = analyze_multiple_reviews(comp_texts)
-            
-            # Store competitor ABSA in analyses table
+ 
+            # Open/closed status
+            is_open = place.get("opening_hours", {}).get("open_now", None)
+            if is_open is True:
+                status = "Open"
+            elif is_open is False:
+                status = "Closed"
+            else:
+                status = "Unknown"
+ 
+            comp_rating  = float(comp_db.rating or 0)
+            comp_reviews = int(comp_db.total_reviews or 0)
+ 
+            # Rating position label
+            if comp_rating > your_rating:
+                position = "Leader"
+            elif comp_rating >= your_rating * 0.95:
+                position = "Challenger"
+            else:
+                position = "Follower"
+ 
+            # Light ABSA on competitor reviews
             try:
-                crud.create_analysis(
-                    db=db,
-                    business_id=crud.get_or_create_business(
-                        db=db,
-                        place_id=competitor['place_id'],
-                        name=competitor['name'],
-                        category=request.category,
-                        address=competitor['address'],
-                        location=request.location,
-                        latitude=None,
-                        longitude=None,
-                        rating=competitor['rating'],
-                        total_reviews=competitor['total_reviews']
-                    ).id,
-                    analysis_type="absa_competitor",
-                    total_reviews_analyzed=len(comp_texts),
-                    aspect_results=comp_analysis_results,
-                    overall_sentiment=None,
-                    average_rating=competitor['rating']
+                comp_details  = gmaps.place(
+                    place_id=place["place_id"],
+                    fields=["reviews"],
                 )
-            except Exception as e:
-                logger.warning(f"Failed to store competitor ABSA: {e}")
-
-            # Compute 1-5 aspect scores for this competitor
-            competitor_aspect_scores[competitor['name']] = compute_aspect_scores(comp_analysis_results)
-
-        # Step 8: Aggregate competitor average per aspect
-        # Consider aspects present in either main or any competitor
-        all_aspects = set(main_aspect_scores.keys())
+                comp_reviews_data = comp_details.get("result", {}).get("reviews", [])
+                comp_texts = [r["text"] for r in comp_reviews_data if r.get("text")]
+                comp_absa  = analyze_multiple_reviews(comp_texts) if comp_texts else {}
+            except Exception:
+                comp_absa = {}
+ 
+            comp_scores = compute_aspect_scores_1_5(comp_absa)
+            competitor_aspect_scores[place.get("name", f"competitor_{rank}")] = comp_scores
+ 
+            # Store competitor record
+            comp_record = crud.create_competitor_analysis(
+                db=db,
+                main_business_id=main_db.id,
+                competitor_place_id=place["place_id"],
+                competitor_name=comp_db.name,
+                competitor_rating=comp_rating,
+                competitor_reviews=comp_reviews,
+                competitor_address=comp_db.address or "",
+                rank=rank,
+                rating_difference=round(your_rating - comp_rating, 2),
+                review_difference=your_reviews - comp_reviews,
+                search_radius=request.radius,
+                search_category=request.category,
+            )
+            crud.update_competitor_zomato(
+                db=db,
+                competitor_id=comp_record.id,
+                aspect_scores=comp_scores,
+                absa_summary=comp_absa,
+            )
+ 
+            competitors_out.append({
+                "name":         comp_db.name,
+                "rating":       comp_rating,
+                "reviews":      comp_reviews,
+                "status":       status,
+                "category":     request.category,
+                "position":     position,
+                "address":      comp_db.address,
+                "aspect_scores": comp_scores,
+            })
+ 
+        # ── Your ABSA scores ───────────────────────────────────────
+        main_analysis = (
+            crud.get_latest_analysis(db, main_db.id, "absa_full") or
+            crud.get_latest_analysis(db, main_db.id, "absa_with_insights") or
+            crud.get_latest_analysis(db, main_db.id, "absa")
+        )
+        if main_analysis and main_analysis.aspect_results:
+            # aspect_results may be nested {google_maps: {...}, zomato: {...}}
+            ar = main_analysis.aspect_results
+            if "google_maps" in ar:
+                combined_absa: Dict[str, Any] = {}
+                for src_data in ar.values():
+                    if isinstance(src_data, dict):
+                        for asp, data in src_data.items():
+                            if asp not in combined_absa:
+                                combined_absa[asp] = data
+                your_scores = compute_aspect_scores_1_5(combined_absa)
+            else:
+                your_scores = compute_aspect_scores_1_5(ar)
+        else:
+            your_scores = {}
+ 
+        # ── Aspect showdown ────────────────────────────────────────
+        all_aspects = set(your_scores.keys())
         for scores in competitor_aspect_scores.values():
             all_aspects.update(scores.keys())
-        
+ 
         aspect_showdown = []
-        for aspect in sorted(all_aspects):
-            your_score = main_aspect_scores.get(aspect)
-            # Average across competitors with that aspect
-            vals = [scores.get(aspect) for scores in competitor_aspect_scores.values() if scores.get(aspect) is not None]
-            comp_avg = round(sum(vals) / len(vals), 2) if vals else None
-            # Only include if at least one side has a score
-            if your_score is not None or comp_avg is not None:
-                aspect_showdown.append({
-                    "aspect": aspect,
-                    "your_score": your_score,
-                    "competitor_avg": comp_avg,
-                    "scale": "1-5"
-                })
-
-        # Step 9: Calculate overall competitive metrics (ratings based)
-        if top_4_competitors:
-            avg_competitor_rating = sum(c['rating'] for c in top_4_competitors) / len(top_4_competitors)
-            avg_competitor_reviews = sum(c['total_reviews'] for c in top_4_competitors) / len(top_4_competitors)
-            rating_comparison = "above" if your_rating > avg_competitor_rating else "below" if your_rating < avg_competitor_rating else "equal to"
-            review_comparison = "more" if your_reviews > avg_competitor_reviews else "fewer" if your_reviews < avg_competitor_reviews else "same as"
-            competitive_analysis = {
-                "average_competitor_rating": round(avg_competitor_rating, 2),
-                "average_competitor_reviews": round(avg_competitor_reviews, 0),
-                "your_rating_vs_average": rating_comparison,
-                "your_reviews_vs_average": review_comparison,
-                "rating_difference": round(your_rating - avg_competitor_rating, 2),
-                "review_difference": your_reviews - avg_competitor_reviews,
-                "market_position": "Leader" if your_rating > avg_competitor_rating else "Challenger" if your_rating >= avg_competitor_rating * 0.9 else "Follower"
-            }
+        for asp in sorted(all_aspects):
+            comp_vals = [
+                s[asp] for s in competitor_aspect_scores.values() if asp in s
+            ]
+            aspect_showdown.append({
+                "aspect":           asp,
+                "your_score":       your_scores.get(asp),
+                "competitor_avg":   round(sum(comp_vals) / len(comp_vals), 2) if comp_vals else None,
+                "scale":            "1-5",
+            })
+ 
+        # ── Market position metrics ────────────────────────────────
+        if competitors_out:
+            avg_comp_rating  = round(
+                sum(c["rating"] for c in competitors_out) / len(competitors_out), 2
+            )
+            avg_comp_reviews = round(
+                sum(c["reviews"] for c in competitors_out) / len(competitors_out)
+            )
         else:
-            competitive_analysis = None
-        
-        # Log execution
+            avg_comp_rating  = 0.0
+            avg_comp_reviews = 0
+ 
+        if avg_comp_rating:
+            if your_rating > avg_comp_rating:
+                market_position = "Leader"
+            elif your_rating >= avg_comp_rating * 0.95:
+                market_position = "Challenger"
+            else:
+                market_position = "Follower"
+        else:
+            market_position = "Unknown"
+ 
+        # rating_vs_reviews_chart — scatter data
+        rating_vs_reviews_chart = [
+            {"name": main_db.name + " (You)", "rating": your_rating, "reviews": your_reviews}
+        ] + [
+            {"name": c["name"], "rating": c["rating"], "reviews": c["reviews"]}
+            for c in competitors_out
+        ]
+ 
         execution_time = int((datetime.now() - start_time).total_seconds() * 1000)
         crud.log_analysis(
-            db=db,
-            business_name=request.business_name,
-            category=request.category,
-            location=request.location,
-            endpoint="/analyze/competitors",
-            status="success",
-            execution_time_ms=execution_time
+            db=db, business_name=request.business_name,
+            category=request.category, location=request.city,
+            endpoint="/analyze/competitors", status="success",
+            execution_time_ms=execution_time,
         )
-        
+ 
         return {
             "status": "success",
-            "main_business": main_info,
-            "competitors": top_4_competitors,
-            "total_competitors_found": len(competitors),
-            "competitors_stored_in_db": len(stored_competitors),
-            "competitive_analysis": competitive_analysis,
-            "aspect_showdown": {
-                "aspects": aspect_showdown,
-                "methodology": "Scores per aspect computed from sentiment breakdown (Positive=1, Neutral=0.5, Negative=0) scaled to 1-5"
+            "main_business": {
+                "name":          main_db.name,
+                "rating":        your_rating,
+                "total_reviews": your_reviews,
+                "address":       main_db.address,
             },
-            "competitor_aspect_scores": competitor_aspect_scores,
-            "search_parameters": {
-                "category": request.category,
-                "location": request.location,
-                "radius_meters": request.radius,
-                "radius_miles": round(request.radius * 0.000621371, 2)
+            "market_position": {
+                "position":             market_position,
+                "your_rating":          your_rating,
+                "avg_competitor_rating": avg_comp_rating,
+                "avg_competitor_reviews": avg_comp_reviews,
+                "rating_vs_avg":        round(your_rating - avg_comp_rating, 2),
             },
-            "data_source": "database_optimized",
-            "execution_time_ms": execution_time
+            "competitors":              competitors_out,
+            "rating_vs_reviews_chart":  rating_vs_reviews_chart,
+            "aspect_showdown":          aspect_showdown,
+            "total_competitors_found":  len(raw_competitors),
+            "execution_time_ms":        execution_time,
         }
-        
-    except googlemaps.exceptions.ApiError as e:
-        logger.error(f"Google Maps API error: {e}")
-        raise HTTPException(status_code=502, detail=f"Google Maps API error: {str(e)}")
+ 
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error analyzing competitors: {e}")
-        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+        logger.error(f"Competitors endpoint error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-
-# Market Intelligence endpoint - Web Scraping
+# ───────────────────────────────────────────────────────────────────
+# 5.  NEW ENDPOINT  /market-intelligence  (POST — Market Intelligence page)
+#     Replaces the old POST /market-intelligence (which tracked competitors).
+#     Old GET /market-intelligence/{business_name} is UNCHANGED.
+# ───────────────────────────────────────────────────────────────────
+ 
 @app.post("/market-intelligence")
 async def get_market_intelligence(
     request: MarketIntelligenceRequest,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
     """
-    Scrape Google News for business mentions and news articles
-    
-    This endpoint:
-    1. Searches Google News for your business name
-    2. Optionally searches for competitor mentions
-    3. Stores all results in the database
-    4. Returns aggregated news intelligence
-    
-    Use this for:
-    - Media monitoring
-    - Brand reputation tracking
-    - Competitive intelligence
-    - PR impact analysis
-    
-    Args:
-        request: MarketIntelligenceRequest with business name and optional competitors
-        db: Database session (injected)
-        
+    Market Intelligence page — XGBoost rating forecast + Google News.
+ 
     Returns:
-        Dictionary with news articles and market insights
+    - forecast: current_rating, predicted_rating, expected_change, trend, confidence
+    - forecast_data: monthly [{month, forecast, actual}]
+    - news: total_articles, media_visibility, top_sources, articles (with links)
     """
     start_time = datetime.now()
-    
-    try:
-        logger.info(f"Starting market intelligence scan for: {request.business_name}")
-        
-        # Prepare list of queries
-        queries = [request.business_name]
-        if request.include_competitors and request.competitor_names:
-            queries.extend(request.competitor_names)
-        
-        # Scrape Google News for all queries
-        all_results = {}
-        total_articles = 0
-        
-        for query in queries:
-            logger.info(f"Scraping news for: {query}")
-            articles = scrape_google_news(
-                query_term=query,
-                location=request.location,
-                max_results=10
-            )
-            
-            all_results[query] = articles
-            total_articles += len(articles)
-            
-            logger.info(f"Found {len(articles)} articles for {query}")
-        
-        # Store results in database
-        stored_count = 0
-        
-        for query, articles in all_results.items():
-            # Get or create business record (or use a generic placeholder)
-            # For competitor tracking, we might not have Google Maps data
-            business = crud.get_business_by_place_id(db, f"news_only_{query.lower().replace(' ', '_')}")
-            
-            if not business:
-                # Create a placeholder business record for news tracking
-                business = crud.create_business(
-                    db=db,
-                    place_id=f"news_only_{query.lower().replace(' ', '_')}",
-                    name=query,
-                    category="news_tracking",
-                    location=request.location
-                )
-            
-            # Store each article
-            for article in articles:
-                try:
-                    crud.create_web_scraping_result(
-                        db=db,
-                        business_id=business.id,
-                        query_term=query,
-                        headline=article['headline'],
-                        link=article['link'],
-                        source_name=article['source_name']
-                    )
-                    stored_count += 1
-                except Exception as e:
-                    logger.warning(f"Error storing article: {e}")
-                    continue
-        
-        # Generate summary insights
-        main_business_articles = all_results.get(request.business_name, [])
-        
-        # Count articles by source
-        source_distribution = {}
-        for articles in all_results.values():
-            for article in articles:
-                source = article['source_name']
-                source_distribution[source] = source_distribution.get(source, 0) + 1
-        
-        # Calculate execution time
-        execution_time = int((datetime.now() - start_time).total_seconds() * 1000)
-        
-        # Log in history
-        crud.log_analysis(
-            db=db,
-            business_name=request.business_name,
-            category="news_tracking",
-            location=request.location,
-            endpoint="/market-intelligence",
-            status="success",
-            execution_time_ms=execution_time
-        )
-        
-        logger.info(f"✅ Market intelligence scan complete: {total_articles} articles found, {stored_count} stored")
-        
-        return {
-            "status": "success",
-            "business_name": request.business_name,
-            "location": request.location,
-            "total_articles_found": total_articles,
-            "articles_stored_in_db": stored_count,
-            "queries_searched": queries,
-            "results": {
-                query: {
-                    "article_count": len(articles),
-                    "articles": articles
-                }
-                for query, articles in all_results.items()
-            },
-            "insights": {
-                "main_business_mentions": len(main_business_articles),
-                "competitor_mentions": total_articles - len(main_business_articles) if request.include_competitors else 0,
-                "top_sources": dict(sorted(source_distribution.items(), key=lambda x: x[1], reverse=True)[:5]),
-                "media_visibility": "High" if len(main_business_articles) >= 5 else "Medium" if len(main_business_articles) >= 2 else "Low"
-            },
-            "execution_time_ms": execution_time,
-            "scraped_at": datetime.now().isoformat()
-        }
-        
-    except Exception as e:
-        logger.error(f"Error in market intelligence scan: {e}")
-        
-        # Log failed attempt
+ 
+    # ── Derive sentiment_score from stored ABSA if not provided ───
+    sentiment_score = request.sentiment_score
+    if sentiment_score is None:
         try:
-            execution_time = int((datetime.now() - start_time).total_seconds() * 1000)
-            crud.log_analysis(
-                db=db,
-                business_name=request.business_name,
-                category="news_tracking",
-                location=request.location or "Unknown",
-                endpoint="/market-intelligence",
-                status="failed",
-                error_message=str(e),
-                execution_time_ms=execution_time
-            )
-        except:
-            pass
-        
-        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
-
+            biz = crud.get_business_by_name(db, request.business_name, request.city)
+            if biz:
+                analysis = (
+                    crud.get_latest_analysis(db, biz.id, "absa_full") or
+                    crud.get_latest_analysis(db, biz.id, "absa_with_insights") or
+                    crud.get_latest_analysis(db, biz.id, "absa")
+                )
+                if analysis and analysis.aspect_results:
+                    ar = analysis.aspect_results
+                    # Flatten nested or flat structure
+                    flat: Dict[str, Any] = {}
+                    for v in ar.values():
+                        if isinstance(v, dict):
+                            for asp, data in v.items():
+                                if isinstance(data, dict) and "average_confidence" in data:
+                                    flat[asp] = data
+                                elif isinstance(data, dict) and "overall_sentiment" in data:
+                                    flat[asp] = data
+                    if flat:
+                        pos_count = sum(
+                            1 for d in flat.values()
+                            if isinstance(d, dict) and d.get("overall_sentiment") == "Positive"
+                        )
+                        sentiment_score = round(pos_count / len(flat), 3)
+        except Exception as e:
+            logger.warning(f"Could not derive sentiment score: {e}")
+ 
+        if sentiment_score is None:
+            sentiment_score = 0.6   # neutral fallback
+ 
+    # ── XGBoost Forecast ──────────────────────────────────────────
+    try:
+        predictions = generate_rating_forecast(
+            city=request.city,
+            category=request.category,
+            current_rating=request.current_rating,
+            sentiment_score=sentiment_score,
+            months_ahead=request.months_ahead,
+        )
+        forecast_summary = get_forecast_summary(predictions)
+    except Exception as e:
+        logger.error(f"Forecast error: {e}")
+        predictions      = []
+        forecast_summary = {}
+ 
+    # ── Google News ───────────────────────────────────────────────
+    news_location = request.location or request.city
+    try:
+        articles = scrape_google_news(
+            query_term=request.business_name,
+            location=news_location,
+            max_results=25,
+        )
+    except Exception as e:
+        logger.error(f"News scrape error: {e}")
+        articles = []
+ 
+    # Store news
+    biz = crud.get_business_by_name(db, request.business_name, request.city)
+    if biz:
+        for article in articles:
+            try:
+                crud.create_web_scraping_result(
+                    db=db,
+                    business_id=biz.id,
+                    query_term=request.business_name,
+                    headline=article["headline"],
+                    link=article["link"],
+                    source_name=article["source_name"],
+                )
+            except Exception:
+                pass
+ 
+    # Top sources (by frequency)
+    source_counts: Dict[str, int] = {}
+    for a in articles:
+        src = a.get("source_name") or "Unknown"
+        source_counts[src] = source_counts.get(src, 0) + 1
+    top_sources = [
+        {"source": k, "count": v}
+        for k, v in sorted(source_counts.items(), key=lambda x: x[1], reverse=True)[:5]
+    ]
+ 
+    media_visibility = (
+        "High" if len(articles) >= 10
+        else "Medium" if len(articles) >= 4
+        else "Low"
+    )
+ 
+    execution_time = int((datetime.now() - start_time).total_seconds() * 1000)
+ 
+    return {
+        "status": "success",
+        "forecast": {
+            "current_rating":   request.current_rating,
+            "predicted_rating": forecast_summary.get("predicted_rating"),
+            "expected_change":  forecast_summary.get("rating_change"),
+            "expected_change_pct": forecast_summary.get("percentage_change"),
+            "trend":            forecast_summary.get("trend"),
+            "confidence":       forecast_summary.get("confidence"),
+            "sentiment_score_used": sentiment_score,
+        },
+        "forecast_data":    predictions,
+        "news": {
+            "total_articles":    len(articles),
+            "media_visibility":  media_visibility,
+            "top_sources":       top_sources,
+            "articles": [
+                {
+                    "headline":    a["headline"],
+                    "link":        a["link"],
+                    "source_name": a.get("source_name", "Unknown"),
+                }
+                for a in articles
+            ],
+        },
+        "execution_time_ms": execution_time,
+    }
+ 
 
 # Get stored market intelligence
 @app.get("/market-intelligence/{business_name}")
@@ -1148,73 +1208,6 @@ async def get_stored_market_intelligence(
     except Exception as e:
         logger.error(f"Error retrieving market intelligence: {e}")
         raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
-
-
-# Star Rating Forecast endpoint
-@app.post("/forecast")
-async def get_rating_forecast(request: ForecastRequest) -> Dict[str, Any]:
-    """
-    Generate star rating forecast using XGBoost model
-    
-    This endpoint:
-    1. Takes business info (city, category, rating, sentiment)
-    2. Uses trained XGBoost model to predict future ratings
-    3. Returns monthly forecast data for visualization
-    
-    Args:
-        request: ForecastRequest with business details and sentiment
-        
-    Returns:
-        Dictionary with forecast data and summary statistics
-    """
-    start_time = datetime.now()
-    
-    try:
-        logger.info(f"Generating forecast for {request.business_name} in {request.city}")
-        
-        # Generate forecast using XGBoost model
-        predictions = generate_rating_forecast(
-            city=request.city,
-            category=request.category,
-            current_rating=request.current_rating,
-            sentiment_score=request.sentiment_score,
-            months_ahead=request.months_ahead
-        )
-        
-        # Get summary statistics
-        summary = get_forecast_summary(predictions)
-        
-        # Calculate execution time
-        execution_time = int((datetime.now() - start_time).total_seconds() * 1000)
-        
-        logger.info(f"✅ Forecast generated: {summary['trend']} trend, {summary['rating_change']:+.2f} change")
-        
-        return {
-            "status": "success",
-            "business_name": request.business_name,
-            "city": request.city,
-            "category": request.category,
-            "forecast_data": predictions,
-            "summary": summary,
-            "model": "XGBoost",
-            "input_parameters": {
-                "current_rating": request.current_rating,
-                "sentiment_score": request.sentiment_score,
-                "months_ahead": request.months_ahead
-            },
-            "execution_time_ms": execution_time,
-            "generated_at": datetime.now().isoformat()
-        }
-        
-    except FileNotFoundError:
-        logger.error("Model file not found")
-        raise HTTPException(
-            status_code=503,
-            detail="Forecasting model not found. Please ensure star_forecasting_model.pkl exists in models/ directory"
-        )
-    except Exception as e:
-        logger.error(f"Error generating forecast: {e}")
-        raise HTTPException(status_code=500, detail=f"Error generating forecast: {str(e)}")
 
 
 # Run the application
