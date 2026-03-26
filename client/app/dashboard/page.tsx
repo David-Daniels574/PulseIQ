@@ -12,14 +12,12 @@ import {
   getSwotFramework,
   getPestelFramework,
   getMeceFramework,
-  getOrmReviews,
   getMarketIntelligence,
   mapCompetitorToDashboardData,
   mapInsightsToDashboardData,
   mapSwotFrameworkToDashboardFields,
   mapPestelFrameworkToDashboardFields,
   mapMeceFrameworkToDashboardFields,
-  mapOrmReviewsToDashboardFields,
   mapMarketIntelligenceToDashboardFields,
 } from "@/services/dashboard.service"
 
@@ -66,6 +64,8 @@ export default function DashboardPage() {
   const [city, setCity] = useState("")
   const [twitterQuery, setTwitterQuery] = useState("")
   const [monthsBack, setMonthsBack] = useState("2")
+  const [menuImage, setMenuImage] = useState<string | null>(null)
+  const [menuImageFile, setMenuImageFile] = useState<File | null>(null)
   const [hasSearched, setHasSearched] = useState(false)
   const [isMarketLoading, setIsMarketLoading] = useState(false)
 
@@ -140,19 +140,6 @@ export default function DashboardPage() {
         })
         .catch((err) => console.error("MECE fetch failed:", err))
 
-      // Fire ORM reviews call non-blocking — replaces synthetic rows with DB reviews
-      void getOrmReviews({
-        business_name: name,
-        city: cityVal,
-        place_id: placeId,
-        limit: 40,
-      })
-        .then((ormResp) => {
-          const ormFields = mapOrmReviewsToDashboardFields(ormResp)
-          setDashboardData((prev) => (prev ? { ...prev, ...ormFields } : prev))
-        })
-        .catch((err) => console.error("ORM reviews fetch failed:", err))
-
       // Fire market-intelligence call non-blocking — updates forecast + news when ready
       setIsMarketLoading(true)
       void getMarketIntelligence({
@@ -181,6 +168,23 @@ export default function DashboardPage() {
     if (businessName.trim() && area.trim() && city.trim()) {
       void loadInsights(businessName, area, city, twitterQuery, monthsBack)
     }
+  }
+
+  const handleMenuImageChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    if (file) {
+      setMenuImageFile(file)
+      const reader = new FileReader()
+      reader.onload = (event) => {
+        setMenuImage(event.target?.result as string)
+      }
+      reader.readAsDataURL(file)
+    }
+  }
+
+  const clearMenuImage = () => {
+    setMenuImage(null)
+    setMenuImageFile(null)
   }
 
   const handleRefresh = () => {
@@ -231,6 +235,46 @@ export default function DashboardPage() {
                 onChange={(e) => setCity(e.target.value)}
                 className="w-full px-3 py-2 border border-input rounded-md bg-background text-foreground placeholder-muted-foreground focus:outline-none focus:ring-2 focus:ring-primary"
               />
+            </div>
+
+            <div>
+              <label className="block text-sm font-medium text-foreground mb-2">Menu Image</label>
+              <div className="relative">
+                {!menuImage ? (
+                  <label className="flex items-center justify-center w-full px-4 py-6 border-2 border-dashed border-input rounded-md cursor-pointer hover:border-primary/50 hover:bg-primary/5 transition-colors">
+                    <div className="text-center">
+                      <svg className="mx-auto h-8 w-8 text-muted-foreground" stroke="currentColor" fill="none" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
+                      </svg>
+                      <p className="mt-1 text-sm text-muted-foreground">Click to upload menu image</p>
+                    </div>
+                    <input
+                      type="file"
+                      accept="image/*"
+                      onChange={handleMenuImageChange}
+                      className="hidden"
+                      aria-label="Upload menu image"
+                    />
+                  </label>
+                ) : (
+                  <div className="relative group">
+                    <img
+                      src={menuImage}
+                      alt="Menu preview"
+                      className="w-full h-32 object-cover rounded-md border border-input"
+                    />
+                    <button
+                      type="button"
+                      onClick={clearMenuImage}
+                      className="absolute top-1 right-1 bg-red-500 hover:bg-red-600 text-white rounded-full p-1 opacity-0 group-hover:opacity-100 transition-opacity"
+                    >
+                      <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                      </svg>
+                    </button>
+                  </div>
+                )}
+              </div>
             </div>
 
             <div>
