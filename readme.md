@@ -1,8 +1,8 @@
-# SmartKhaana
+# PulseIQ
 
 AI-powered restaurant intelligence dashboard built for HackNiche by Team ByteForge.
 
-SmartKhaana helps restaurant owners turn reviews, social chatter, and web signals into practical business decisions across operations, marketing, ORM, and strategy.
+PulseIQ helps restaurant owners turn reviews, social chatter, and web signals into practical business decisions across operations, marketing, ORM, and strategy.
 
 ## What This Project Does
 
