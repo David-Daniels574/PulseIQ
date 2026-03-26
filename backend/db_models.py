@@ -220,11 +220,11 @@ class SocialReview(Base):
 
 # ─────────────────────────────────────────────
 # NEW TABLE — SocialMenuItem
-# Menu items inferred from social discussion (for BCG Matrix)
+# Menu items persisted for strategy frameworks (social + OCR uploads)
 # ─────────────────────────────────────────────
 
 class SocialMenuItem(Base):
-    __tablename__ = "zomato_menu_items"
+    __tablename__ = "menu_items"
 
     id          = Column(Integer, primary_key=True, index=True)
     business_id = Column(Integer, ForeignKey("businesses.id", ondelete="CASCADE"), nullable=False)
@@ -235,7 +235,7 @@ class SocialMenuItem(Base):
     description = Column(Text)
     is_veg      = Column(Boolean)
 
-    # Populated after ABSA + review cross-referencing
+    # Populated from scraped sources and/or OCR menu-image extraction
     mention_count      = Column(Integer, default=0)   # how many reviews mention this item
     positive_mentions  = Column(Integer, default=0)
     negative_mentions  = Column(Integer, default=0)

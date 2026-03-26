@@ -57,6 +57,26 @@ def get_business_by_name(db: Session, name: str, location: str) -> Optional[mode
     ).first()
 
 
+def find_business_flexible(
+    db: Session,
+    name: str,
+    location: Optional[str] = None,
+) -> Optional[models.Business]:
+    """
+    Resolve business robustly when city/location data may be missing or stale.
+    Tries name+location first, then falls back to name-only most recent record.
+    """
+    base_q = db.query(models.Business).filter(models.Business.name.ilike(f"%{name}%"))
+
+    if location and location.strip():
+        with_loc = base_q.filter(models.Business.location.ilike(f"%{location.strip()}%"))
+        match = with_loc.order_by(desc(models.Business.updated_at), desc(models.Business.created_at)).first()
+        if match:
+            return match
+
+    return base_q.order_by(desc(models.Business.updated_at), desc(models.Business.created_at)).first()
+
+
 def get_or_create_business(db: Session, place_id: str, **kwargs) -> models.Business:
     business = get_business_by_place_id(db, place_id)
     if not business:
@@ -668,12 +688,15 @@ def save_framework_reports(
     sources_used: List[str],
 ) -> List[models.FrameworkReport]:
     """
-    Save one FrameworkReport row per framework (8 rows total).
-    Clears previous rows for this business first.
+    Save one FrameworkReport row per framework.
+    Replaces only the frameworks being saved, preserving other framework rows.
     """
-    db.query(models.FrameworkReport).filter(
-        models.FrameworkReport.business_id == business_id
-    ).delete()
+    framework_names = list(frameworks.keys())
+    if framework_names:
+        db.query(models.FrameworkReport).filter(
+            models.FrameworkReport.business_id == business_id,
+            models.FrameworkReport.framework.in_(framework_names),
+        ).delete(synchronize_session=False)
     db.commit()
 
     rows = []

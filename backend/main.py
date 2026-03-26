@@ -9,14 +9,20 @@ from typing import Optional, Dict, Any, List
 import uvicorn
 import logging
 import math
+import base64
+import re
 from services.twitter_scraper import get_restaurant_reviews
 import os
 from dotenv import load_dotenv
 import googlemaps
 from datetime import datetime
+from io import BytesIO
 from sqlalchemy.orm import Session
 from fastapi.middleware.cors import CORSMiddleware
 import nltk
+import requests
+import chromadb
+import time
 
 import logging
 logging.basicConfig(level=logging.INFO)
@@ -180,6 +186,8 @@ class OverviewRequest(BaseModel):
     city: str          = Field(..., description="City e.g. 'Mumbai'")
     twitter_query: Optional[str] = Field(None, description="Optional specific query for Twitter. Defaults to business name.")
     airtop_invocation_id: Optional[str] = Field(None, description="Optional AirTop invocation id. If provided, AirTop agent result reviews are merged into social stream.")
+    menu_image_base64: Optional[str] = Field(None, description="Optional base64-encoded menu image (data URI supported) for OCR extraction.")
+    menu_image_url: Optional[str] = Field(None, description="Optional direct URL to menu image when base64 is not provided.")
     months_back: Optional[int] = Field(6, ge=1, le=24, description="How many months of data to include (default 6)")
 
 
@@ -202,11 +210,40 @@ class PESTELFrameworkRequest(BaseModel):
     months_back: Optional[int] = Field(6, ge=1, le=24, description="How many months of data to include (default 6)")
 
 
+class FourPsFrameworkRequest(BaseModel):
+    """Request for dedicated 4P marketing framework generation"""
+    business_name: str = Field(..., description="Name of the restaurant")
+    area: str = Field(..., description="Area/neighbourhood e.g. 'Colaba'")
+    city: str = Field(..., description="City e.g. 'Mumbai'")
+    place_id: Optional[str] = Field(None, description="Optional Google Maps place_id for direct lookup")
+    months_back: Optional[int] = Field(6, ge=1, le=24, description="How many months of data to include (default 6)")
+
+
+class BCGFrameworkRequest(BaseModel):
+    """Request for dedicated BCG matrix generation from menu-level sentiment"""
+    business_name: str = Field(..., description="Name of the restaurant")
+    area: str = Field(..., description="Area/neighbourhood e.g. 'Colaba'")
+    city: str = Field(..., description="City e.g. 'Mumbai'")
+    place_id: Optional[str] = Field(None, description="Optional Google Maps place_id for direct lookup")
+    min_high_mentions: Optional[int] = Field(2, ge=1, le=20, description="Minimum mentions threshold for high-volume items")
+    months_back: Optional[int] = Field(6, ge=1, le=24, description="How many months of data to include (default 6)")
+
+
+class AnsoffFrameworkRequest(BaseModel):
+    """Request for dedicated Ansoff growth strategy generation"""
+    business_name: str = Field(..., description="Name of the restaurant")
+    area: str = Field(..., description="Area/neighbourhood e.g. 'Colaba'")
+    city: str = Field(..., description="City e.g. 'Mumbai'")
+    place_id: Optional[str] = Field(None, description="Optional Google Maps place_id for direct lookup")
+    months_back: Optional[int] = Field(6, ge=1, le=24, description="How many months of data to include (default 6)")
+
+
 class MECEFrameworkRequest(BaseModel):
     """Request for dedicated MECE complaint framework generation"""
     business_name: str = Field(..., description="Name of the restaurant")
     area: str = Field(..., description="Area/neighbourhood e.g. 'Colaba'")
     city: str = Field(..., description="City e.g. 'Mumbai'")
+    place_id: Optional[str] = Field(None, description="Optional Google Maps place_id for direct lookup")
     product_focus: Optional[str] = Field("pizzas", description="Product lens for recommendations (default: pizzas)")
     months_back: Optional[int] = Field(6, ge=1, le=24, description="How many months of data to include (default 6)")
  
@@ -265,6 +302,213 @@ class FrameworkCitationResponse(BaseModel):
     source_url: Optional[str]
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class RAGChatRequest(BaseModel):
+    """Request model for RAG-based restaurant chatbot"""
+    business_name: str = Field(..., description="Name of the restaurant")
+    city: str = Field(..., description="City of the restaurant")
+    question: str = Field(..., description="User question about the restaurant")
+    conversation_history: Optional[List[Dict[str, str]]] = Field(
+        None,
+        description="Previous conversation messages with roles (system, user, assistant)",
+    )
+
+
+class RAGChatResponse(BaseModel):
+    """Response model for RAG chatbot"""
+    status: str = Field(..., description="Status of the response")
+    answer: str = Field(..., description="Answer from Featherless-hosted model")
+    context_used: List[str] = Field(..., description="Relevant context snippets from Chroma DB")
+    context_count: int = Field(..., description="Number of context snippets used")
+    model: str = Field(..., description="Model used for generation")
+
+
+def _decode_base64_image(data: str) -> bytes:
+    payload = data.strip()
+    if "," in payload and "base64" in payload[:80].lower():
+        payload = payload.split(",", 1)[1]
+    return base64.b64decode(payload)
+
+
+def _extract_menu_items_from_ocr_text(ocr_text: str) -> List[Dict[str, Any]]:
+    items: List[Dict[str, Any]] = []
+    seen_names = set()
+
+    skip_tokens = {
+        "subtotal", "total", "gst", "cgst", "sgst", "tax", "service charge",
+        "amount due", "discount", "grand total",
+    }
+    patterns = [
+        re.compile(r"^(?P<name>.+?)\s*(?:-|–|:|\|)?\s*(?:rs\.?|inr|₹)\s*(?P<price>\d{1,5}(?:[.,]\d{1,2})?)\s*$", re.IGNORECASE),
+        re.compile(r"^(?P<name>.+?)\s{2,}(?P<price>\d{1,5}(?:[.,]\d{1,2})?)\s*$", re.IGNORECASE),
+        re.compile(r"^(?P<name>[A-Za-z].*?)\s+(?P<price>\d{2,5}(?:[.,]\d{1,2})?)\s*$", re.IGNORECASE),
+    ]
+
+    for raw_line in ocr_text.splitlines():
+        line = re.sub(r"\s+", " ", raw_line).strip(" -–|\t")
+        if len(line) < 3:
+            continue
+
+        lowered = line.lower()
+        if any(token in lowered for token in skip_tokens):
+            continue
+
+        match = None
+        for pattern in patterns:
+            match = pattern.match(line)
+            if match:
+                break
+        if not match:
+            continue
+
+        name = match.group("name").strip(" .-–|:")
+        if len(name) < 2:
+            continue
+
+        try:
+            price = float(match.group("price").replace(",", "."))
+        except ValueError:
+            continue
+
+        dedupe_key = name.lower()
+        if dedupe_key in seen_names:
+            continue
+        seen_names.add(dedupe_key)
+
+        items.append(
+            {
+                "name": name,
+                "price": price,
+                "category": "menu",
+                "description": "Extracted from uploaded menu image via OCR",
+            }
+        )
+
+    return items
+
+
+def _extract_menu_items_from_image_bytes(image_bytes: bytes) -> List[Dict[str, Any]]:
+    try:
+        from PIL import Image
+        import pytesseract
+    except Exception as imp_err:
+        raise RuntimeError("pytesseract and Pillow are required for menu OCR") from imp_err
+
+    image = Image.open(BytesIO(image_bytes)).convert("L")
+    ocr_text = pytesseract.image_to_string(image)
+    return _extract_menu_items_from_ocr_text(ocr_text)
+
+
+def _resolve_framework_business(db: Session, business_name: str, city: str, place_id: Optional[str] = None):
+    if place_id:
+        by_place = crud.get_business_by_place_id(db, place_id)
+        if by_place:
+            return by_place
+    return crud.find_business_flexible(db, business_name, city)
+
+
+def _infer_review_sentiment_from_text(rating: Optional[float], review_text: str) -> str:
+    if rating is not None:
+        if float(rating) >= 4:
+            return "Positive"
+        if float(rating) <= 2:
+            return "Negative"
+
+    text = (review_text or "").lower()
+    pos_words = ["good", "great", "amazing", "excellent", "tasty", "delicious", "fresh", "love"]
+    neg_words = ["bad", "poor", "worst", "bland", "stale", "expensive", "slow", "cold"]
+    pos_hits = sum(1 for w in pos_words if w in text)
+    neg_hits = sum(1 for w in neg_words if w in text)
+    if pos_hits > neg_hits:
+        return "Positive"
+    if neg_hits > pos_hits:
+        return "Negative"
+    return "Neutral"
+
+
+def _compute_menu_mentions(menu_rows: List[Any], reviews: List[Any], min_high_mentions: int = 2) -> Dict[str, Any]:
+    scored_items: List[Dict[str, Any]] = []
+
+    lowered_reviews = [
+        {
+            "text": (r.review_text or "").lower(),
+            "rating": r.rating,
+            "raw": r.review_text or "",
+        }
+        for r in reviews
+        if r.review_text
+    ]
+
+    for item in menu_rows:
+        name = (item.name or "").strip()
+        if not name:
+            continue
+        token = name.lower()
+        regex = re.compile(rf"\b{re.escape(token)}\b", re.IGNORECASE)
+
+        mention_count = 0
+        positive_mentions = 0
+        negative_mentions = 0
+
+        for rev in lowered_reviews:
+            txt = rev["text"]
+            if token not in txt:
+                continue
+            if not regex.search(txt):
+                continue
+
+            mention_count += 1
+            sentiment = _infer_review_sentiment_from_text(rev["rating"], rev["raw"])
+            if sentiment == "Positive":
+                positive_mentions += 1
+            elif sentiment == "Negative":
+                negative_mentions += 1
+
+        scored_items.append(
+            {
+                "name": name,
+                "price": item.price,
+                "category": item.category,
+                "description": item.description,
+                "is_veg": item.is_veg,
+                "mention_count": mention_count,
+                "positive_mentions": positive_mentions,
+                "negative_mentions": negative_mentions,
+                "bcg_category": None,
+            }
+        )
+
+    mention_values = [i["mention_count"] for i in scored_items]
+    avg_mentions = (sum(mention_values) / len(mention_values)) if mention_values else 0
+    high_threshold = max(int(min_high_mentions or 2), int(round(avg_mentions)) if avg_mentions else 2)
+
+    for item in scored_items:
+        mentions = item["mention_count"]
+        pos = item["positive_mentions"]
+        neg = item["negative_mentions"]
+        mixed = pos > 0 and neg > 0
+
+        if mentions >= high_threshold and pos > neg:
+            category = "Star"
+            reason = f"High mentions ({mentions}) and predominantly positive sentiment ({pos} vs {neg})."
+        elif mentions >= high_threshold and mixed:
+            category = "Cash Cow"
+            reason = f"High mentions ({mentions}) with mixed sentiment ({pos} positive, {neg} negative)."
+        elif mentions < high_threshold and pos >= neg:
+            category = "Question Mark"
+            reason = f"Low mentions ({mentions}) but positive potential ({pos} positive mentions)."
+        else:
+            category = "Dog"
+            reason = f"Low traction ({mentions}) and weak sentiment ({neg} negative mentions)."
+
+        item["bcg_category"] = category
+        item["bcg_reason"] = reason
+
+    return {
+        "high_mentions_threshold": high_threshold,
+        "items": scored_items,
+    }
  
 
 # Startup event
@@ -301,10 +545,14 @@ async def root():
             "/analyze/business/insights": "POST - Fetch reviews, analyze, AND generate strategic insights (STORED IN DB)",
             "/analyze/frameworks/swot": "POST - Generate SWOT framework with source citations",
             "/analyze/frameworks/pestel": "POST - Generate PESTEL + 4P framework from cached DB data",
+            "/analyze/frameworks/four-ps": "POST - Generate data-grounded 4P marketing framework",
+            "/analyze/frameworks/bcg": "POST - Generate menu-item BCG matrix from mention sentiment",
+            "/analyze/frameworks/ansoff": "POST - Generate Ansoff growth strategy from ABSA + BCG",
             "/analyze/frameworks/mece": "POST - Generate MECE complaint framework from pre-clustered buckets",
             "/analyze/competitors": "POST - Find and analyze top 4 competitors in your area",
             "/market-intelligence": "POST - Star-rating forecast + industry trend and market news",
             "/insights/generate": "POST - Generate insights from existing ABSA results",
+            "/chatbot/rag": "POST - RAG chatbot using Chroma context + Featherless model",
             "/insights/response-template": "POST - Generate review response templates",
             "/history": "GET - View analysis history",
             "/businesses": "GET - List all analyzed businesses",
@@ -437,6 +685,37 @@ async def analyze_business_overview(
             total_reviews=gmap_total,
         )
         logger.info("Step 2 complete (DB upsert business)")
+
+        # Optional menu OCR input; stores product/price rows for reuse in other framework APIs.
+        menu_ocr_status = "not_provided"
+        try:
+            extracted_menu_items: List[Dict[str, Any]] = []
+            if request.menu_image_base64:
+                image_bytes = _decode_base64_image(request.menu_image_base64)
+                extracted_menu_items = _extract_menu_items_from_image_bytes(image_bytes)
+                menu_ocr_status = "processed_base64"
+            elif request.menu_image_url:
+                menu_resp = requests.get(request.menu_image_url, timeout=20)
+                menu_resp.raise_for_status()
+                extracted_menu_items = _extract_menu_items_from_image_bytes(menu_resp.content)
+                menu_ocr_status = "processed_url"
+
+            if extracted_menu_items:
+                crud.upsert_menu_items(db=db, business_id=business_db.id, items=extracted_menu_items)
+                logger.info("Menu OCR extracted %d items", len(extracted_menu_items))
+        except Exception as menu_err:
+            menu_ocr_status = "failed"
+            logger.warning(f"Menu OCR failed: {menu_err}")
+
+        stored_menu_rows = crud.get_menu_items(db=db, business_id=business_db.id)
+        menu_items_out = [
+            {
+                "name": m.name,
+                "price": m.price,
+                "category": m.category,
+            }
+            for m in stored_menu_rows
+        ]
 
         # Step 3: ABSA setup
         set_aspect_keywords_for_category("restaurant")
@@ -678,6 +957,11 @@ async def analyze_business_overview(
                 "twitter_query_used": twitter_query,
                 "months_back": request.months_back,
             },
+            "menu_ocr": {
+                "status": menu_ocr_status,
+                "items_stored": len(menu_items_out),
+            },
+            "menu_items": menu_items_out,
             "summary_stats": {
                 "total_reviews": len(all_review_texts),
                 "avg_rating": avg_rating,
@@ -725,11 +1009,7 @@ async def analyze_swot_framework(
     start_time = datetime.now()
 
     try:
-        # Try place_id lookup first (most reliable), fallback to name-based lookup
-        if request.place_id:
-            business_db = crud.get_business_by_place_id(db, request.place_id)
-        else:
-            business_db = crud.get_business_by_name(db, request.business_name, request.city)
+        business_db = _resolve_framework_business(db, request.business_name, request.city, request.place_id)
         
         if not business_db:
             raise HTTPException(
@@ -956,11 +1236,7 @@ async def analyze_pestel_framework(
     start_time = datetime.now()
 
     try:
-        # Try place_id lookup first (most reliable), fallback to name-based lookup
-        if request.place_id:
-            business_db = crud.get_business_by_place_id(db, request.place_id)
-        else:
-            business_db = crud.get_business_by_name(db, request.business_name, request.city)
+        business_db = _resolve_framework_business(db, request.business_name, request.city, request.place_id)
 
         if not business_db:
             raise HTTPException(
@@ -1140,7 +1416,7 @@ async def analyze_mece_framework(
     start_time = datetime.now()
 
     try:
-        business_db = crud.get_business_by_name(db, request.business_name, request.city)
+        business_db = _resolve_framework_business(db, request.business_name, request.city, request.place_id)
         if not business_db:
             raise HTTPException(
                 status_code=404,
@@ -1237,6 +1513,358 @@ async def analyze_mece_framework(
             pass
         raise HTTPException(status_code=500, detail=str(e))
 
+
+@app.post("/analyze/frameworks/four-ps")
+async def analyze_four_ps_framework(
+    request: FourPsFrameworkRequest,
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """
+    Dedicated 4P framework API grounded in DB data:
+    Product=ABSA aspects, Price=menu+price mentions, Place=location/delivery,
+    Promotion=social virality/news signals.
+    """
+    start_time = datetime.now()
+
+    try:
+        business_db = _resolve_framework_business(db, request.business_name, request.city, request.place_id)
+        if not business_db:
+            raise HTTPException(status_code=404, detail="Business not found in DB. Run /analyze/business/insights first.")
+
+        analysis_db = (
+            crud.get_latest_analysis(db, business_db.id, "absa_full")
+            or crud.get_latest_analysis(db, business_db.id, "absa_with_insights")
+            or crud.get_latest_analysis(db, business_db.id, "absa")
+        )
+        if not analysis_db:
+            raise HTTPException(status_code=400, detail="No ABSA analysis found. Run /analyze/business/insights first.")
+
+        aggregated_rows = crud.get_aggregated_absa(db, business_db.id)
+        reviews = crud.get_reviews_by_business(db, business_db.id)
+        menu_rows = crud.get_menu_items(db, business_db.id)
+        news_rows = crud.get_scraping_results_by_business(db, business_db.id, limit=100)
+
+        product_aspects = [
+            {
+                "aspect": row.aspect,
+                "sentiment": row.overall_sentiment,
+                "confidence_score": float(row.confidence_score or 0),
+            }
+            for row in aggregated_rows
+            if row.aspect in {"Food", "Service", "Ambiance", "Price", "Location"}
+        ]
+
+        menu_prices = [float(m.price) for m in menu_rows if m.price is not None]
+        avg_menu_price = round(sum(menu_prices) / len(menu_prices), 2) if menu_prices else None
+        review_texts = [r.review_text.lower() for r in reviews if r.review_text]
+        expensive_mentions = sum(1 for t in review_texts if any(k in t for k in ["expensive", "overpriced", "costly", "pricey"]))
+        value_mentions = sum(1 for t in review_texts if any(k in t for k in ["value", "worth", "affordable", "reasonable"]))
+
+        delivery_mentions = sum(1 for t in review_texts if any(k in t for k in ["delivery", "zomato", "swiggy", "takeaway", "parcel"]))
+        dinein_mentions = sum(1 for t in review_texts if any(k in t for k in ["dine", "ambience", "seating", "view", "marine drive"]))
+
+        twitter_count = len([r for r in reviews if (r.source or "") == "twitter"])
+        airtop_count = len([r for r in reviews if (r.source or "") == "airtop"])
+        news_count = len(news_rows)
+        virality_index = {
+            "social_mentions": twitter_count + airtop_count,
+            "news_mentions": news_count,
+            "photo_count": int(business_db.photo_count or 0),
+            "score": int((twitter_count + airtop_count) * 2 + news_count + (business_db.photo_count or 0) * 0.1),
+        }
+
+        four_ps_json = {
+            "product": {
+                "absa_aspects": product_aspects,
+                "menu_item_count": len(menu_rows),
+            },
+            "price": {
+                "price_range": business_db.price_range,
+                "avg_menu_price": avg_menu_price,
+                "price_mentions": {
+                    "expensive": expensive_mentions,
+                    "value_for_money": value_mentions,
+                },
+            },
+            "place": {
+                "address": business_db.address,
+                "city": business_db.location,
+                "delivery_mentions": delivery_mentions,
+                "dine_in_mentions": dinein_mentions,
+                "google_maps_rating": business_db.rating,
+                "google_maps_reviews": business_db.total_reviews,
+            },
+            "promotion": {
+                "virality_index": virality_index,
+                "news_count": news_count,
+                "recommended_focus": (
+                    "Boost digital campaigns" if virality_index["score"] < 25 else "Sustain momentum with targeted promotions"
+                ),
+            },
+        }
+
+        avg_conf = round(
+            sum(float(x.get("confidence_score", 0)) for x in product_aspects) / (len(product_aspects) or 1),
+            1,
+        )
+
+        reports = crud.save_framework_reports(
+            db=db,
+            business_id=business_db.id,
+            analysis_id=analysis_db.id,
+            frameworks={"four_ps": four_ps_json},
+            avg_confidence_per_framework={"four_ps": avg_conf},
+            sources_used=["google_maps", "twitter", "airtop", "news", "menu"],
+        )
+
+        execution_time = int((datetime.now() - start_time).total_seconds() * 1000)
+        return {
+            "status": "success",
+            "business_info": {
+                "name": business_db.name,
+                "area": request.area,
+                "city": request.city,
+                "place_id": business_db.place_id,
+            },
+            "framework": {
+                "type": "four_ps",
+                "avg_score_pct": avg_conf,
+                "result_json": four_ps_json,
+            },
+            "report_id": reports[0].id if reports else None,
+            "execution_time_ms": execution_time,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"4P framework endpoint error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/analyze/frameworks/bcg")
+async def analyze_bcg_framework(
+    request: BCGFrameworkRequest,
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """
+    Dedicated BCG API based on menu-item mention counts + sentiment from reviews.
+    """
+    start_time = datetime.now()
+
+    try:
+        business_db = _resolve_framework_business(db, request.business_name, request.city, request.place_id)
+        if not business_db:
+            raise HTTPException(status_code=404, detail="Business not found in DB. Run /analyze/business/insights first.")
+
+        analysis_db = (
+            crud.get_latest_analysis(db, business_db.id, "absa_full")
+            or crud.get_latest_analysis(db, business_db.id, "absa_with_insights")
+            or crud.get_latest_analysis(db, business_db.id, "absa")
+        )
+        if not analysis_db:
+            raise HTTPException(status_code=400, detail="No ABSA analysis found. Run /analyze/business/insights first.")
+
+        menu_rows = crud.get_menu_items(db, business_db.id)
+        if not menu_rows:
+            raise HTTPException(status_code=400, detail="No menu items found. Send menu image to /analyze/business/insights first.")
+
+        reviews = crud.get_reviews_by_business(db, business_db.id)
+        scoring = _compute_menu_mentions(menu_rows, reviews, request.min_high_mentions or 2)
+        items = scoring["items"]
+
+        # Persist updated mention/sentiment-derived fields for downstream APIs.
+        crud.upsert_menu_items(db=db, business_id=business_db.id, items=items)
+
+        grouped = {"Star": [], "Cash Cow": [], "Question Mark": [], "Dog": []}
+        for item in items:
+            grouped[item["bcg_category"]].append(
+                {
+                    "item": item["name"],
+                    "price": item.get("price"),
+                    "mention_count": item["mention_count"],
+                    "positive_mentions": item["positive_mentions"],
+                    "negative_mentions": item["negative_mentions"],
+                    "reason": item.get("bcg_reason"),
+                }
+            )
+
+        bcg_json = {
+            "high_mentions_threshold": scoring["high_mentions_threshold"],
+            "menu_items": [
+                {
+                    "item": item["name"],
+                    "price": item.get("price"),
+                    "classification": item["bcg_category"],
+                    "mention_count": item["mention_count"],
+                    "positive_mentions": item["positive_mentions"],
+                    "negative_mentions": item["negative_mentions"],
+                    "reason": item.get("bcg_reason"),
+                }
+                for item in items
+            ],
+            "matrix": grouped,
+        }
+
+        covered_items = sum(1 for i in items if i["mention_count"] > 0)
+        coverage_score = round((covered_items / (len(items) or 1)) * 100, 1)
+
+        reports = crud.save_framework_reports(
+            db=db,
+            business_id=business_db.id,
+            analysis_id=analysis_db.id,
+            frameworks={"bcg": bcg_json},
+            avg_confidence_per_framework={"bcg": coverage_score},
+            sources_used=["menu", "google_maps", "twitter", "airtop"],
+        )
+
+        execution_time = int((datetime.now() - start_time).total_seconds() * 1000)
+        return {
+            "status": "success",
+            "business_info": {
+                "name": business_db.name,
+                "area": request.area,
+                "city": request.city,
+                "place_id": business_db.place_id,
+            },
+            "framework": {
+                "type": "bcg",
+                "avg_score_pct": coverage_score,
+                "result_json": bcg_json,
+            },
+            "report_id": reports[0].id if reports else None,
+            "execution_time_ms": execution_time,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"BCG framework endpoint error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/analyze/frameworks/ansoff")
+async def analyze_ansoff_framework(
+    request: AnsoffFrameworkRequest,
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """
+    Dedicated Ansoff API based on market signal + ABSA confidence + BCG outputs.
+    """
+    start_time = datetime.now()
+
+    try:
+        business_db = _resolve_framework_business(db, request.business_name, request.city, request.place_id)
+        if not business_db:
+            raise HTTPException(status_code=404, detail="Business not found in DB. Run /analyze/business/insights first.")
+
+        analysis_db = (
+            crud.get_latest_analysis(db, business_db.id, "absa_full")
+            or crud.get_latest_analysis(db, business_db.id, "absa_with_insights")
+            or crud.get_latest_analysis(db, business_db.id, "absa")
+        )
+        if not analysis_db:
+            raise HTTPException(status_code=400, detail="No ABSA analysis found. Run /analyze/business/insights first.")
+
+        aggregated_rows = crud.get_aggregated_absa(db, business_db.id)
+        reviews = crud.get_reviews_by_business(db, business_db.id)
+        news_rows = crud.get_scraping_results_by_business(db, business_db.id, limit=100)
+
+        # Reuse cached BCG if available; otherwise compute from current menu+reviews.
+        bcg_report = crud.get_framework_report(db, business_db.id, "bcg")
+        if bcg_report and isinstance(bcg_report.result_json, dict):
+            bcg_items = bcg_report.result_json.get("menu_items", [])
+        else:
+            menu_rows = crud.get_menu_items(db, business_db.id)
+            bcg_items = []
+            if menu_rows:
+                scoring = _compute_menu_mentions(menu_rows, reviews, 2)
+                bcg_items = [
+                    {
+                        "item": i["name"],
+                        "classification": i["bcg_category"],
+                        "mention_count": i["mention_count"],
+                    }
+                    for i in scoring["items"]
+                ]
+
+        avg_conf = round(
+            sum(float(r.confidence_score or 0) for r in aggregated_rows) / (len(aggregated_rows) or 1),
+            1,
+        )
+        positive_aspects = [r.aspect for r in aggregated_rows if (r.overall_sentiment or "") == "Positive"]
+        question_marks = [i["item"] for i in bcg_items if i.get("classification") == "Question Mark"]
+
+        social_volume = len([r for r in reviews if (r.source or "") in {"twitter", "airtop"}])
+        news_count = len(news_rows)
+
+        ansoff_json = {
+            "market_penetration": {
+                "focus": "Do more of what works in current market",
+                "drivers": positive_aspects[:5],
+                "recommendation": "Amplify best-rated strengths in local campaigns and retention offers.",
+            },
+            "product_development": {
+                "focus": "Improve or reposition promising but low-traction menu items",
+                "question_mark_items": question_marks,
+                "recommendation": "Refine recipes/pricing for Question Marks and run limited promotions.",
+            },
+            "market_development": {
+                "focus": "Expand to adjacent demand pockets",
+                "signals": {
+                    "news_mentions": news_count,
+                    "social_volume": social_volume,
+                },
+                "recommendation": (
+                    "Pilot expansion/partnerships in nearby micro-markets." if (news_count + social_volume) >= 20
+                    else "Build stronger awareness before expansion to new areas."
+                ),
+            },
+            "diversification": {
+                "focus": "High-risk exploratory bets",
+                "risk_level": "High" if avg_conf < 45 else "Moderate",
+                "recommendation": (
+                    "Avoid major diversification until confidence improves." if avg_conf < 45
+                    else "Test small adjacent offerings with strict KPI gates."
+                ),
+            },
+            "overall_market_position": {
+                "absa_confidence": avg_conf,
+                "positive_aspect_count": len(positive_aspects),
+                "bcg_item_count": len(bcg_items),
+            },
+        }
+
+        reports = crud.save_framework_reports(
+            db=db,
+            business_id=business_db.id,
+            analysis_id=analysis_db.id,
+            frameworks={"ansoff": ansoff_json},
+            avg_confidence_per_framework={"ansoff": avg_conf},
+            sources_used=["google_maps", "twitter", "airtop", "news", "menu", "bcg"],
+        )
+
+        execution_time = int((datetime.now() - start_time).total_seconds() * 1000)
+        return {
+            "status": "success",
+            "business_info": {
+                "name": business_db.name,
+                "area": request.area,
+                "city": request.city,
+                "place_id": business_db.place_id,
+            },
+            "framework": {
+                "type": "ansoff",
+                "avg_score_pct": avg_conf,
+                "result_json": ansoff_json,
+            },
+            "report_id": reports[0].id if reports else None,
+            "execution_time_ms": execution_time,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Ansoff framework endpoint error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 # Generate review response template
 @app.post("/insights/response-template")
 async def create_response_template(request: ResponseTemplateRequest) -> Dict[str, Any]:
@@ -1269,6 +1897,189 @@ async def create_response_template(request: ResponseTemplateRequest) -> Dict[str
     except Exception as e:
         logger.error(f"Error generating response template: {e}")
         raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+
+
+@app.post("/chatbot/rag", response_model=RAGChatResponse)
+async def rag_chatbot(request: RAGChatRequest) -> RAGChatResponse:
+    """
+    RAG-based chatbot for restaurant Q&A.
+
+    Flow:
+    - Retrieve relevant review snippets from local Chroma DB.
+    - Send question + context to Featherless chat completions API.
+    - Return model answer and the context used.
+    """
+    try:
+        featherless_api_key = os.getenv("FEATHERLESS_API_KEY")
+        if not featherless_api_key:
+            raise HTTPException(
+                status_code=500,
+                detail="FEATHERLESS_API_KEY not configured in .env file",
+            )
+
+        chroma_path = os.getenv("CHROMA_DB_PATH", "chroma_db")
+        context_snippets: List[str] = []
+
+        try:
+            chroma_client = chromadb.PersistentClient(path=chroma_path)
+            collection = chroma_client.get_collection(name="reviews")
+            results = collection.query(query_texts=[request.question], n_results=5)
+            if results and results.get("documents"):
+                context_snippets = results["documents"][0] if results["documents"] else []
+        except Exception as chroma_err:
+            logger.warning(f"Chroma DB context retrieval failed: {chroma_err}")
+            context_snippets = []
+
+        system_prompt = (
+            f"You are a helpful AI assistant for {request.business_name}, a restaurant in {request.city}.\n\n"
+            "Your role is to answer questions about the restaurant based on customer feedback and reviews.\n"
+            "Be helpful, professional, and honest. If you do not have information, say so clearly.\n\n"
+            "Context from customer reviews and data:\n"
+        )
+
+        if context_snippets:
+            system_prompt += "\n".join([f"- {snippet}" for snippet in context_snippets])
+        else:
+            system_prompt += "- No review data available yet."
+
+        messages: List[Dict[str, str]] = [{"role": "system", "content": system_prompt}]
+
+        if request.conversation_history:
+            for msg in request.conversation_history:
+                role = (msg.get("role") or "").strip().lower()
+                content = (msg.get("content") or "").strip()
+                if role in {"system", "user", "assistant"} and content:
+                    messages.append({"role": role, "content": content})
+
+        messages.append({"role": "user", "content": request.question})
+
+        featherless_url = "https://api.featherless.ai/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {featherless_api_key}",
+            "Content-Type": "application/json",
+        }
+        preferred_model = (os.getenv("FEATHERLESS_MODEL") or "deepseek-ai/DeepSeek-V3").strip()
+        fallback_models = [
+            m.strip()
+            for m in (os.getenv("FEATHERLESS_FALLBACK_MODELS", "") or "").split(",")
+            if m.strip()
+        ]
+
+        candidate_models: List[str] = []
+        for m in [preferred_model] + fallback_models:
+            if m and m not in candidate_models:
+                candidate_models.append(m)
+
+        # Optional model discovery to avoid hard failures when a configured model ID is unavailable.
+        try:
+            models_resp = requests.get("https://api.featherless.ai/v1/models", headers=headers, timeout=20)
+            if models_resp.status_code == 200:
+                available_models = {
+                    (row or {}).get("id")
+                    for row in (models_resp.json() or {}).get("data", [])
+                    if (row or {}).get("id")
+                }
+                if available_models:
+                    resolved_candidates = [m for m in candidate_models if m in available_models]
+                    if not resolved_candidates:
+                        # Fall back to first available model if configured candidates are not listed.
+                        first_available = next(iter(available_models))
+                        resolved_candidates = [first_available]
+                    candidate_models = resolved_candidates
+        except Exception as models_err:
+            logger.warning(f"Could not fetch Featherless model catalog: {models_err}")
+
+        if not candidate_models:
+            candidate_models = ["deepseek-ai/DeepSeek-V3"]
+
+        last_error_detail = "Featherless request failed"
+        final_status_code = 503
+        response_data: Dict[str, Any] = {}
+        selected_model = candidate_models[0]
+
+        for model_name in candidate_models:
+            selected_model = model_name
+            payload = {
+                "model": model_name,
+                "messages": messages,
+                "temperature": 0.7,
+                "max_tokens": 500,
+            }
+
+            response = None
+            for attempt in range(3):
+                response = requests.post(featherless_url, headers=headers, json=payload, timeout=30)
+                if response.status_code != 503:
+                    break
+                if attempt < 2:
+                    time.sleep(1.2 * (attempt + 1))
+
+            if response is None:
+                continue
+
+            if response.status_code < 400:
+                response_data = response.json()
+                final_status_code = 200
+                break
+
+            raw_text = response.text[:500]
+            lower_text = raw_text.lower()
+            logger.error(f"Featherless API error ({model_name}): {response.status_code} - {raw_text}")
+
+            if response.status_code == 401:
+                final_status_code = 401
+                last_error_detail = "Featherless 401 Unauthenticated: API key not recognized. Verify FEATHERLESS_API_KEY or generate a new key."
+                break
+            if response.status_code == 403:
+                final_status_code = 403
+                last_error_detail = "Featherless 403 Unauthorized: model is gated for this account. Unlock the model and accept its license terms."
+                break
+            if response.status_code == 500:
+                final_status_code = 502
+                last_error_detail = "Featherless 500 Internal Server Error: provider could not process the request. Check for unsupported parameters and retry."
+                break
+            if response.status_code == 503:
+                final_status_code = 503
+                last_error_detail = "Featherless 503 Service Unavailable: insufficient capacity or cold model. Retried 3 times; please retry shortly."
+                continue
+
+            is_model_not_found = response.status_code == 404 and (
+                "model_not_found" in lower_text or "does not exist" in lower_text
+            )
+            if is_model_not_found:
+                final_status_code = 503
+                last_error_detail = (
+                    f"Configured model '{model_name}' is not available on Featherless. "
+                    "Set FEATHERLESS_MODEL to a valid model ID or provide FEATHERLESS_FALLBACK_MODELS."
+                )
+                continue
+
+            final_status_code = 502
+            last_error_detail = f"Featherless API error: HTTP {response.status_code}."
+            break
+
+        if final_status_code >= 400:
+            raise HTTPException(status_code=final_status_code, detail=last_error_detail)
+
+        answer = (
+            response_data.get("choices", [{}])[0]
+            .get("message", {})
+            .get("content", "No response generated")
+        )
+
+        return RAGChatResponse(
+            status="success",
+            answer=answer,
+            context_used=context_snippets,
+            context_count=len(context_snippets),
+            model=selected_model,
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"RAG chatbot error: {e}")
+        raise HTTPException(status_code=500, detail=f"Chatbot error: {str(e)}")
 
 
 @app.post("/insights/publish-review-reply")
