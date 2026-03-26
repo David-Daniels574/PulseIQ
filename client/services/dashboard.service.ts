@@ -819,18 +819,44 @@ export function mapInsightsToDashboardData(payload: InsightsResponse): Dashboard
   const neutral = Math.round(payload.sentiment_breakdown?.neutral ?? 0)
   const negative = Math.round(payload.sentiment_breakdown?.negative ?? 0)
 
-  const sourceEntries = Object.entries(payload.source_breakdown ?? {})
-  const totalSourceCount = sourceEntries.reduce((sum, [, value]) => {
-    const count = Number((value.review_count as number) ?? (value.article_count as number) ?? 0)
-    return sum + (Number.isFinite(count) ? count : 0)
-  }, 0)
+  const rawSourceBreakdown = (payload.source_breakdown ?? {}) as Record<string, unknown>
+  const hasAirtopSourceBreakdown =
+    rawSourceBreakdown.airtop_sources &&
+    typeof rawSourceBreakdown.airtop_sources === "object" &&
+    !Array.isArray(rawSourceBreakdown.airtop_sources)
 
-  const sourceBreakdownData = sourceEntries
-    .map(([source, value]) => {
-      const count = Number((value.review_count as number) ?? (value.article_count as number) ?? 0)
-      const percentage = totalSourceCount > 0 ? Math.round((count / totalSourceCount) * 100) : 0
-      return { source: titleCase(source), count, percentage }
-    })
+  const expandedSourceCounts: Array<{ source: string; count: number }> = []
+  for (const [source, value] of Object.entries(rawSourceBreakdown)) {
+    if (source === "airtop_sources" && value && typeof value === "object" && !Array.isArray(value)) {
+      for (const [airtopSource, airtopCount] of Object.entries(value as Record<string, unknown>)) {
+        const count = Number(airtopCount ?? 0)
+        if (Number.isFinite(count) && count > 0) {
+          expandedSourceCounts.push({ source: titleCase(airtopSource), count })
+        }
+      }
+      continue
+    }
+
+    if (source === "airtop" && hasAirtopSourceBreakdown) {
+      // Skip aggregate Airtop bucket when detailed source split is available.
+      continue
+    }
+
+    if (value && typeof value === "object" && !Array.isArray(value)) {
+      const sourceValue = value as Record<string, unknown>
+      const count = Number((sourceValue.review_count as number) ?? (sourceValue.article_count as number) ?? 0)
+      if (Number.isFinite(count) && count > 0) {
+        expandedSourceCounts.push({ source: titleCase(source), count })
+      }
+    }
+  }
+
+  const totalSourceCount = expandedSourceCounts.reduce((sum, item) => sum + item.count, 0)
+  const sourceBreakdownData = expandedSourceCounts
+    .map((item) => ({
+      ...item,
+      percentage: totalSourceCount > 0 ? Math.round((item.count / totalSourceCount) * 100) : 0,
+    }))
     .filter((x) => x.count > 0)
 
   const reviewVolumeData = (payload.review_volume_trend ?? []).map((row) => {

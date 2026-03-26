@@ -9,6 +9,7 @@ import {
   DashboardData,
   getBusinessInsights,
   getCompetitorInsights,
+  getOrmReviews,
   getSwotFramework,
   getPestelFramework,
   getMeceFramework,
@@ -139,6 +140,51 @@ export default function DashboardPage() {
           setDashboardData((prev) => (prev ? { ...prev, ...meceFields } : prev))
         })
         .catch((err) => console.error("MECE fetch failed:", err))
+
+      // Fire ORM reviews call non-blocking — updates ORM inbox when ready
+      void getOrmReviews({
+        business_name: name,
+        city: cityVal,
+        place_id: placeId,
+        limit: 30,
+      })
+        .then((ormResp) => {
+          const reviews = (ormResp.reviews ?? []).map((r) => {
+            const rawSentiment = String(r.sentiment ?? "Neutral").toLowerCase()
+            const sentiment = rawSentiment === "positive"
+              ? "Positive"
+              : rawSentiment === "negative"
+                ? "Negative"
+                : "Neutral"
+
+            return {
+              id: Number(r.id ?? 0),
+              rating: Number(r.rating ?? 0),
+              text: r.review_text ?? "",
+              aspect: r.aspect ?? "General",
+              sentiment,
+              source: r.source ?? "Google Maps",
+              date: r.review_date ? String(r.review_date).slice(0, 10) : new Date().toISOString().slice(0, 10),
+              status: r.status ?? "Pending",
+            }
+          })
+
+          setDashboardData((prev) => prev
+            ? {
+                ...prev,
+                ormData: {
+                  reviews,
+                  analytics: {
+                    responseRate: Number(ormResp.summary_stats?.response_rate ?? 0),
+                    avgResponseTime: ormResp.summary_stats?.avg_response_time ?? "N/A",
+                    pendingNegative: Number(ormResp.summary_stats?.pending_negative ?? 0),
+                    sentimentTrend: ormResp.summary_stats?.sentiment_trend ?? "stable",
+                  },
+                },
+              }
+            : prev)
+        })
+        .catch((err) => console.error("ORM reviews fetch failed:", err))
 
       // Fire market-intelligence call non-blocking — updates forecast + news when ready
       setIsMarketLoading(true)
