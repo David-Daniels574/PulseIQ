@@ -54,6 +54,7 @@ import crud
 
 # Import scraper service
 from services.scraper import scrape_google_news, scrape_multiple_queries
+from services.airtop_client import fetch_airtop_invocation_result, normalize_airtop_reviews
 
 # Import forecasting service
 from models.forecasting import generate_rating_forecast, get_forecast_summary
@@ -178,6 +179,7 @@ class OverviewRequest(BaseModel):
     area: str          = Field(..., description="Area/neighbourhood e.g. 'Colaba'")
     city: str          = Field(..., description="City e.g. 'Mumbai'")
     twitter_query: Optional[str] = Field(None, description="Optional specific query for Twitter. Defaults to business name.")
+    airtop_invocation_id: Optional[str] = Field(None, description="Optional AirTop invocation id. If provided, AirTop agent result reviews are merged into social stream.")
     months_back: Optional[int] = Field(6, ge=1, le=24, description="How many months of data to include (default 6)")
 
 
@@ -464,8 +466,40 @@ async def analyze_business_overview(
             logger.warning(f"Twitter scraper failed: {twitter_err}")
             twitter_reviews = []
 
+        # Optional AirTop agent result fetch; merged into social stream.
+        airtop_reviews: List[Dict[str, Any]] = []
+        airtop_invocation_id = request.airtop_invocation_id or os.getenv("AIRTOP_INVOCATION_ID")
+        airtop_api_key = os.getenv("AIRTOP_API_KEY")
+        airtop_agent_id = os.getenv("AGENT_ID")
+        if airtop_api_key and airtop_agent_id and airtop_invocation_id:
+            try:
+                airtop_payload = fetch_airtop_invocation_result(
+                    api_key=airtop_api_key,
+                    agent_id=airtop_agent_id,
+                    invocation_id=airtop_invocation_id,
+                )
+                airtop_reviews = normalize_airtop_reviews(airtop_payload)
+                logger.info(f"AirTop fetch complete: {len(airtop_reviews)} reviews")
+            except Exception as airtop_err:
+                logger.warning(f"AirTop fetch failed: {airtop_err}")
+        else:
+            logger.info("AirTop skipped (missing AIRTOP_API_KEY/AGENT_ID/invocation_id)")
+
         twitter_texts = [t.get("text", "").strip() for t in twitter_reviews if t.get("text")]
-        twitter_absa = analyze_multiple_reviews(twitter_texts) if twitter_texts else {}
+        airtop_texts = [a.get("text", "").strip() for a in airtop_reviews if a.get("text")]
+        social_texts = twitter_texts + airtop_texts
+        airtop_source_counts = dict(
+            sorted(
+                Counter(
+                    (a.get("source_name") or "AirTop")
+                    for a in airtop_reviews
+                    if a.get("text")
+                ).items(),
+                key=lambda x: x[1],
+                reverse=True,
+            )
+        )
+        twitter_absa = analyze_multiple_reviews(social_texts) if social_texts else {}
 
         for t in twitter_reviews:
             text = t.get("text")
@@ -479,10 +513,23 @@ async def analyze_business_overview(
                     review_date=None,
                     source="twitter",
                 )
+
+        for a in airtop_reviews:
+            text = a.get("text")
+            if text:
+                crud.create_review(
+                    db=db,
+                    business_id=business_db.id,
+                    review_text=text,
+                    author_name=a.get("author_name") or "airtop_user",
+                    rating=a.get("rating"),
+                    review_date=None,
+                    source="airtop",
+                )
         logger.info("Step 5 complete (Twitter ABSA + store reviews)")
 
         # Step 6: Build combined ABSA over all review text sources
-        all_review_texts = gmap_texts + twitter_texts
+        all_review_texts = gmap_texts + social_texts
         combined_absa = analyze_multiple_reviews(all_review_texts) if all_review_texts else {}
 
         # Step 7: Confidence engine
@@ -525,6 +572,7 @@ async def analyze_business_overview(
             sources_used={
                 "google_maps": len(gmap_texts),
                 "twitter": len(twitter_texts),
+                "airtop": len(airtop_texts),
             },
         )
         crud.save_aggregated_absa(
@@ -564,6 +612,11 @@ async def analyze_business_overview(
                 "review_count": len(twitter_texts),
                 "query_used": twitter_query,
             },
+            "airtop": {
+                "review_count": len(airtop_texts),
+                "invocation_id": airtop_invocation_id,
+            },
+            "airtop_sources": airtop_source_counts,
         }
 
         month_buckets: Dict[str, int] = {}
